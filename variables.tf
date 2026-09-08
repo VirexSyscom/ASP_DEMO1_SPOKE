@@ -56,7 +56,7 @@ variable "location_short" {
 variable "network_resource_group_name" {
   description = "網路資源群組名稱（Spoke 網路層）"
   type        = string
-  default     = "spoke-network-rg"
+  default     = "Spoke-Network-RG"
 }
 
 variable "create_network_resource_group" {
