@@ -1,0 +1,275 @@
+############################################
+# 訂閱
+#   由 Azure DevOps Service Connection 自動注入
+#   ARM_SUBSCRIPTION_ID，一般無需輸入。
+############################################
+variable "subscription_id" {
+  description = "Azure 訂閱 ID。留 null 由 ARM_SUBSCRIPTION_ID 環境變數提供。"
+  type        = string
+  default     = null
+  nullable    = true
+}
+
+############################################
+# 命名前綴（網路 / HR 共用同一套規則）
+############################################
+variable "name_prefix" {
+  description = "所有資源名稱的前綴詞，例如 demo、hr、corp。留空則不加前綴。資源群組名稱不套用前綴。"
+  type        = string
+  default     = "demo"
+
+  validation {
+    condition     = can(regex("^[a-zA-Z0-9-]*$", var.name_prefix))
+    error_message = "name_prefix 僅能包含英數字與連字號。"
+  }
+
+  validation {
+    condition     = length(var.name_prefix) <= 10
+    error_message = "name_prefix 建議不超過 10 字元，避免資源名稱超出 Azure 長度限制。"
+  }
+}
+
+variable "name_separator" {
+  description = "前綴與資源名稱之間的分隔符號"
+  type        = string
+  default     = "-"
+}
+
+############################################
+# 基本設定
+############################################
+variable "location" {
+  description = "資源部署區域"
+  type        = string
+  default     = "japaneast"
+}
+
+variable "location_short" {
+  description = "區域縮寫，用於資源命名（japaneast = jpe）"
+  type        = string
+  default     = "jpe"
+}
+
+############################################
+# 資源群組（兩個獨立 RG，名稱皆不套用前綴）
+############################################
+variable "network_resource_group_name" {
+  description = "網路資源群組名稱（Spoke 網路層）"
+  type        = string
+  default     = "spoke-network-rg"
+}
+
+variable "create_network_resource_group" {
+  description = "true = 由本組態建立網路 RG；false = 沿用既有 RG"
+  type        = bool
+  default     = true
+}
+
+variable "hr_resource_group_name" {
+  description = "HR 工作負載資源群組名稱"
+  type        = string
+  default     = "Spoke-HR-RG"
+}
+
+variable "create_hr_resource_group" {
+  description = "true = 由本組態建立 HR RG；false = 沿用既有 RG"
+  type        = bool
+  default     = true
+}
+
+############################################
+# 標籤（統一由 locals 合併，資源群組名稱不加前綴，但標籤一律套用）
+############################################
+variable "environment" {
+  description = "環境代號，會自動寫入 Environment 標籤"
+  type        = string
+  default     = "prod"
+
+  validation {
+    condition     = contains(["prod", "uat", "dev", "test"], var.environment)
+    error_message = "environment 必須為 prod、uat、dev 或 test。"
+  }
+}
+
+variable "owner" {
+  description = "資源擁有者，會自動寫入 Owner 標籤"
+  type        = string
+  default     = "network-team"
+}
+
+variable "cost_center" {
+  description = "成本中心代碼，會自動寫入 CostCenter 標籤；留空則不輸出該標籤"
+  type        = string
+  default     = ""
+}
+
+variable "tags" {
+  description = "額外的自訂標籤，會與系統自動產生的共用標籤合併（同名時以此處為準）"
+  type        = map(string)
+  default     = {}
+}
+
+variable "network_tags" {
+  description = "僅套用於網路資源群組資源的額外標籤"
+  type        = map(string)
+  default     = {}
+}
+
+variable "hr_tags" {
+  description = "僅套用於 HR 資源群組資源的額外標籤"
+  type        = map(string)
+  default     = {}
+}
+
+############################################
+# 網路位址
+############################################
+variable "spoke_vnet_address_space" {
+  description = "正式 Spoke VNet 位址空間"
+  type        = list(string)
+  default     = ["10.10.0.0/16"]
+}
+
+variable "uat_spoke_vnet_address_space" {
+  description = "UAT Spoke VNet 位址空間"
+  type        = list(string)
+  default     = ["10.20.0.0/16"]
+}
+
+variable "ap_subnet_prefix" {
+  description = "應用程式子網路（HR VM 佈署於此）"
+  type        = string
+  default     = "10.10.1.0/24"
+}
+
+variable "db_subnet_prefix" {
+  description = "資料庫子網路"
+  type        = string
+  default     = "10.10.2.0/24"
+}
+
+variable "pe_subnet_prefix" {
+  description = "Private Endpoint 專用子網路（HR SQL PE 佈署於此）"
+  type        = string
+  default     = "10.10.3.0/24"
+}
+
+variable "bastion_subnet_prefix" {
+  description = "AzureBastionSubnet 至少需 /26（僅在 create_bastion_subnet = true 時使用）"
+  type        = string
+  default     = "10.10.250.0/26"
+}
+
+variable "uat_workload_subnet_prefix" {
+  description = "UAT 工作負載子網路"
+  type        = string
+  default     = "10.20.1.0/24"
+}
+
+############################################
+# Bastion
+############################################
+variable "bastion_sku" {
+  description = "Bastion SKU。Developer 免公用 IP、免 AzureBastionSubnet，但不支援 VNet peering 與並行連線"
+  type        = string
+  default     = "Developer"
+
+  validation {
+    condition     = contains(["Developer", "Basic", "Standard", "Premium"], var.bastion_sku)
+    error_message = "bastion_sku 必須為 Developer、Basic、Standard 或 Premium。"
+  }
+}
+
+variable "create_bastion_subnet" {
+  description = "是否建立 AzureBastionSubnet。Developer SKU 不需要，設為 false 可省去該子網路"
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !(var.bastion_sku != "Developer" && var.create_bastion_subnet == false)
+    error_message = "Basic/Standard/Premium SKU 必須建立 AzureBastionSubnet，請將 create_bastion_subnet 設為 true。"
+  }
+}
+
+############################################
+# 運算（HR）
+############################################
+variable "vm_names" {
+  description = "HR 虛擬機器基底名稱集合（實際名稱會自動加上前綴）"
+  type        = set(string)
+  default     = ["cm-hr-01", "cm-hr-02"]
+}
+
+variable "vm_size" {
+  description = "HR VM 規格"
+  type        = string
+  default     = "Standard_D2s_v5"
+}
+
+variable "admin_username" {
+  description = "VM 本機管理員帳號"
+  type        = string
+  default     = "azureadmin"
+}
+
+variable "admin_password" {
+  description = "VM 本機管理員密碼。正式環境建議改用 Key Vault 或 TF_VAR 環境變數注入。"
+  type        = string
+  sensitive   = true
+  default     = "@Dmin9487"
+}
+
+############################################
+# 資料庫（HR）
+############################################
+variable "sql_administrator_login" {
+  description = "Azure SQL 管理員帳號"
+  type        = string
+  default     = "sqladminuser"
+}
+
+variable "sql_administrator_password" {
+  description = "Azure SQL 管理員密碼。正式環境建議改用 Key Vault 或 TF_VAR 環境變數注入。"
+  type        = string
+  sensitive   = true
+  default     = "@Dmin9487"
+}
+
+variable "sql_database_sku" {
+  description = "HR 資料庫 SKU"
+  type        = string
+  default     = "S0"
+}
+
+variable "sql_database_max_size_gb" {
+  description = "HR 資料庫容量上限（GB）"
+  type        = number
+  default     = 10
+}
+
+############################################
+# 監控
+############################################
+variable "alert_email" {
+  description = "HR 監控警示收件者"
+  type        = string
+  default     = "ops@example.com"
+}
+
+variable "alert_action_group_id" {
+  description = "網路活動記錄警示要通知的 Action Group 資源 ID；留空則自動改用 HR 的 Email Action Group"
+  type        = string
+  default     = ""
+}
+
+variable "cpu_alert_threshold" {
+  description = "VM CPU 使用率警示門檻（%）"
+  type        = number
+  default     = 80
+}
+
+variable "dtu_alert_threshold" {
+  description = "SQL DTU 使用率警示門檻（%）"
+  type        = number
+  default     = 80
+}
