@@ -19,7 +19,7 @@ location_short = "jpe"
 ############################################
 # 兩個資源群組（名稱不套用前綴）
 ############################################
-network_resource_group_name   = "spoke-network-rg"
+network_resource_group_name   = "Spoke-Network-RG"
 create_network_resource_group = true
 
 hr_resource_group_name   = "Spoke-HR-RG"
