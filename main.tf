@@ -1,11 +1,13 @@
 ############################################
 # main.tf
-#   合併自 1_main（網路 + PROD HR）與 2_main（UAT HR）
+#   整合自 1_main（Spoke 網路 + PROD HR + UAT HR）與 2_main（Hub 網路 + VPN）
+#
 #   統一格式：
 #     1. 命名一律經由 local.name 統一表，套用 local.prefix 前綴
 #     2. 標籤一律以 merge(local.<層>_tags, { ResourceType = ... }) 產生
-#     3. 三個資源群組獨立保留：網路 / PROD HR / UAT HR
-#        RG 名稱不套用前綴，但標籤一律套用
+#     3. 四個資源群組獨立保留：Hub 網路 / Spoke 網路 / PROD HR / UAT HR
+#        RG 名稱一律不套用前綴，但標籤一律套用
+#     4. 每個 RG 皆支援 create_<層>_resource_group 切換「新建 / 沿用既有」
 ############################################
 
 data "azurerm_client_config" "current" {}
@@ -19,7 +21,24 @@ locals {
 
   # ---------- 統一命名表 ----------
   name = {
-    # ===== 網路層 =====
+    # ===== Hub 網路層 =====
+    hub_vnet           = "${local.prefix}Hub-VNET"
+    hub_bastion_subnet = "AzureBastionSubnet" # Azure 保留名稱，不可加前綴
+    gateway_subnet     = "GatewaySubnet"      # Azure 保留名稱，不可加前綴
+    hub_bastion_pip    = "${local.prefix}hub-vnet-bastion-pip"
+    hub_bastion        = "${local.prefix}hub-vnet-bastion"
+    hub_bastion_ipcfg  = "${local.prefix}bastion-ipconfig"
+    vpn_gateway_pip    = "${local.prefix}vpn-gateway-pip"
+    vpn_gateway        = "${local.prefix}vpn-gateway"
+    vpn_gateway_ipcfg  = "${local.prefix}vpn-gateway-ipconfig"
+    local_gateway      = "${local.prefix}fortigate-local-gateway"
+    vpn_connection     = "${local.prefix}to-fortigate-vpn"
+    peer_hub_to_spoke  = "${local.prefix}peer-hub-to-spoke"
+    peer_spoke_to_hub  = "${local.prefix}peer-spoke-to-hub"
+    peer_hub_to_uat    = "${local.prefix}peer-hub-to-uat-spoke"
+    peer_uat_to_hub    = "${local.prefix}peer-uat-spoke-to-hub"
+
+    # ===== Spoke 網路層 =====
     spoke_vnet       = "${local.prefix}Spoke-VNET"
     uat_spoke_vnet   = "${local.prefix}UAT-Spoke-VNET"
     ap_subnet        = "${local.prefix}AP-Subnet"
@@ -84,16 +103,20 @@ locals {
   )
 
   # 各層專屬標籤（在共用標籤之上疊加）
-  network_tags = merge(local.common_tags, { Layer = "Network" }, var.network_tags)
+  hub_tags     = merge(local.common_tags, { Layer = "Network", Tier = "Hub" }, var.hub_tags)
+  network_tags = merge(local.common_tags, { Layer = "Network", Tier = "Spoke" }, var.network_tags)
   hr_tags      = merge(local.common_tags, { Layer = "Workload", Workload = "HR" }, var.hr_tags)
 
-  # UAT 網路資源：沿用網路層標籤但改寫 Environment
+  # UAT 網路資源：沿用 Spoke 網路標籤但改寫 Environment
   uat_tags = merge(local.network_tags, { Environment = "uat" })
 
   # UAT HR 工作負載：沿用 HR 標籤但改寫 Environment
   uat_hr_tags = merge(local.hr_tags, { Environment = "uat" }, var.uat_hr_tags)
 
   # ---------- 資源群組解析 ----------
+  hub_rg_name     = var.create_hub_resource_group ? azurerm_resource_group.hub[0].name : data.azurerm_resource_group.hub_existing[0].name
+  hub_rg_location = var.create_hub_resource_group ? azurerm_resource_group.hub[0].location : data.azurerm_resource_group.hub_existing[0].location
+
   network_rg_name     = var.create_network_resource_group ? azurerm_resource_group.network[0].name : data.azurerm_resource_group.network_existing[0].name
   network_rg_location = var.create_network_resource_group ? azurerm_resource_group.network[0].location : data.azurerm_resource_group.network_existing[0].location
 
@@ -108,6 +131,9 @@ locals {
 
   # 網路活動記錄警示：未指定 Action Group 時，沿用 PROD HR 的 Email Action Group
   effective_alert_action_group_id = var.alert_action_group_id != "" ? var.alert_action_group_id : azurerm_monitor_action_group.email.id
+
+  # Peering 時是否可使用 Hub 的 VPN Gateway 進行 Gateway Transit
+  peering_gateway_transit = var.enable_hub_spoke_peering && var.create_vpn_gateway
 }
 
 ############################################
@@ -144,11 +170,27 @@ resource "random_string" "uat_storage_suffix" {
 }
 
 ############################################
-# 資源群組（三個獨立 RG，名稱皆不套用前綴，但一律套用統一標籤）
-#   1. 網路      var.network_resource_group_name
-#   2. PROD HR   var.hr_resource_group_name
-#   3. UAT  HR   var.uat_hr_resource_group_name
+# 資源群組（四個獨立 RG，名稱皆不套用前綴，但一律套用統一標籤）
+#   1. Hub 網路    var.hub_resource_group_name
+#   2. Spoke 網路  var.network_resource_group_name
+#   3. PROD HR     var.hr_resource_group_name
+#   4. UAT  HR     var.uat_hr_resource_group_name
 ############################################
+data "azurerm_resource_group" "hub_existing" {
+  count = var.create_hub_resource_group ? 0 : 1
+  name  = var.hub_resource_group_name
+}
+
+resource "azurerm_resource_group" "hub" {
+  count    = var.create_hub_resource_group ? 1 : 0
+  name     = var.hub_resource_group_name
+  location = var.location
+
+  tags = merge(local.hub_tags, {
+    ResourceType = "ResourceGroup"
+  })
+}
+
 data "azurerm_resource_group" "network_existing" {
   count = var.create_network_resource_group ? 0 : 1
   name  = var.network_resource_group_name
@@ -195,7 +237,242 @@ resource "azurerm_resource_group" "uat_hr" {
 }
 
 ############################################
-# 【網路】Virtual Network - Spoke-VNET（正式環境）
+# 【Hub】Virtual Network
+############################################
+resource "azurerm_virtual_network" "hub" {
+  name                = local.name.hub_vnet
+  location            = local.hub_rg_location
+  resource_group_name = local.hub_rg_name
+  address_space       = var.hub_vnet_address_space
+
+  tags = merge(local.hub_tags, {
+    ResourceType = "VirtualNetwork"
+    Workload     = "Hub-Network"
+  })
+}
+
+# Azure Bastion 專用子網路，名稱為 Azure 保留字，不可加前綴
+resource "azurerm_subnet" "hub_bastion" {
+  count                = var.create_hub_bastion ? 1 : 0
+  name                 = local.name.hub_bastion_subnet
+  resource_group_name  = local.hub_rg_name
+  virtual_network_name = azurerm_virtual_network.hub.name
+  address_prefixes     = var.hub_bastion_subnet_prefixes
+}
+
+# VPN Gateway 專用子網路，名稱為 Azure 保留字，不可加前綴
+resource "azurerm_subnet" "gateway" {
+  count                = var.create_vpn_gateway ? 1 : 0
+  name                 = local.name.gateway_subnet
+  resource_group_name  = local.hub_rg_name
+  virtual_network_name = azurerm_virtual_network.hub.name
+  address_prefixes     = var.gateway_subnet_prefixes
+}
+
+############################################
+# 【Hub】Bastion（傳統模式：Standard 靜態公用 IP）
+############################################
+resource "azurerm_public_ip" "hub_bastion" {
+  count               = var.create_hub_bastion ? 1 : 0
+  name                = local.name.hub_bastion_pip
+  location            = local.hub_rg_location
+  resource_group_name = local.hub_rg_name
+  allocation_method   = "Static"
+  sku                 = "Standard"
+  ip_version          = "IPv4"
+
+  tags = merge(local.hub_tags, {
+    ResourceType = "PublicIP"
+    Purpose      = "Bastion-Frontend"
+  })
+}
+
+resource "azurerm_bastion_host" "hub" {
+  count               = var.create_hub_bastion ? 1 : 0
+  name                = local.name.hub_bastion
+  location            = local.hub_rg_location
+  resource_group_name = local.hub_rg_name
+  sku                 = var.hub_bastion_sku
+
+  tags = merge(local.hub_tags, {
+    ResourceType = "Bastion"
+    Purpose      = "SecureRemoteAccess"
+    AccessModel  = "PublicIP"
+    Scope        = "HubVNet"
+  })
+
+  ip_configuration {
+    name                 = local.name.hub_bastion_ipcfg
+    subnet_id            = azurerm_subnet.hub_bastion[0].id
+    public_ip_address_id = azurerm_public_ip.hub_bastion[0].id
+  }
+}
+
+############################################
+# 【Hub】VPN Gateway
+############################################
+resource "azurerm_public_ip" "vpn_gateway" {
+  count               = var.create_vpn_gateway ? 1 : 0
+  name                = local.name.vpn_gateway_pip
+  location            = local.hub_rg_location
+  resource_group_name = local.hub_rg_name
+  allocation_method   = "Static"
+  sku                 = "Standard"
+  ip_version          = "IPv4"
+  zones               = var.vpn_gateway_public_ip_zones
+
+  tags = merge(local.hub_tags, {
+    ResourceType = "PublicIP"
+    Purpose      = "VPNGateway-Frontend"
+  })
+}
+
+resource "azurerm_virtual_network_gateway" "vpn" {
+  count               = var.create_vpn_gateway ? 1 : 0
+  name                = local.name.vpn_gateway
+  location            = local.hub_rg_location
+  resource_group_name = local.hub_rg_name
+
+  type          = "Vpn"
+  vpn_type      = "RouteBased"
+  active_active = false
+  enable_bgp    = var.enable_bgp
+  sku           = var.vpn_gateway_sku
+  generation    = "Generation2"
+
+  tags = merge(local.hub_tags, {
+    ResourceType = "VirtualNetworkGateway"
+    Purpose      = "Site-to-Site"
+  })
+
+  ip_configuration {
+    name                          = local.name.vpn_gateway_ipcfg
+    public_ip_address_id          = azurerm_public_ip.vpn_gateway[0].id
+    private_ip_address_allocation = "Dynamic"
+    subnet_id                     = azurerm_subnet.gateway[0].id
+  }
+}
+
+############################################
+# 【Hub】Local Network Gateway（地端 FortiGate）
+############################################
+resource "azurerm_local_network_gateway" "fortigate" {
+  count               = var.create_vpn_gateway ? 1 : 0
+  name                = local.name.local_gateway
+  location            = local.hub_rg_location
+  resource_group_name = local.hub_rg_name
+
+  gateway_address = var.onprem_vpn_public_ip
+  address_space   = var.onprem_address_spaces
+
+  tags = merge(local.hub_tags, {
+    ResourceType = "LocalNetworkGateway"
+    Purpose      = "OnPremises-FortiGate"
+  })
+}
+
+############################################
+# 【Hub】Site-to-Site IPsec Connection
+############################################
+resource "azurerm_virtual_network_gateway_connection" "fortigate" {
+  count               = var.create_vpn_gateway && var.create_vpn_connection ? 1 : 0
+  name                = local.name.vpn_connection
+  location            = local.hub_rg_location
+  resource_group_name = local.hub_rg_name
+
+  type                       = "IPsec"
+  virtual_network_gateway_id = azurerm_virtual_network_gateway.vpn[0].id
+  local_network_gateway_id   = azurerm_local_network_gateway.fortigate[0].id
+  shared_key                 = var.vpn_shared_key
+  enable_bgp                 = var.enable_bgp
+
+  tags = merge(local.hub_tags, {
+    ResourceType = "VpnConnection"
+    Purpose      = "Site-to-Site"
+  })
+
+  # 若 FortiGate 有指定 IKE/IPsec Proposal，可取消下面區塊註解，
+  # 並依 FortiGate Phase 1 / Phase 2 設定調整。
+  #
+  # ipsec_policy {
+  #   dh_group         = "DHGroup14"
+  #   ike_encryption   = "AES256"
+  #   ike_integrity    = "SHA256"
+  #   ipsec_encryption = "AES256"
+  #   ipsec_integrity  = "SHA256"
+  #   pfs_group        = "PFS14"
+  #   sa_datasize      = 102400000
+  #   sa_lifetime      = 27000
+  # }
+}
+
+############################################
+# 【Hub <-> Spoke】VNet Peering
+#   注意：Spoke 端的 Bastion 若使用 Developer SKU，
+#         無法透過 peering 連線至其他 VNet 的 VM。
+############################################
+resource "azurerm_virtual_network_peering" "hub_to_spoke" {
+  count                     = var.enable_hub_spoke_peering ? 1 : 0
+  name                      = local.name.peer_hub_to_spoke
+  resource_group_name       = local.hub_rg_name
+  virtual_network_name      = azurerm_virtual_network.hub.name
+  remote_virtual_network_id = azurerm_virtual_network.spoke.id
+
+  allow_virtual_network_access = true
+  allow_forwarded_traffic      = true
+  allow_gateway_transit        = local.peering_gateway_transit
+  use_remote_gateways          = false
+
+  depends_on = [azurerm_virtual_network_gateway.vpn]
+}
+
+resource "azurerm_virtual_network_peering" "spoke_to_hub" {
+  count                     = var.enable_hub_spoke_peering ? 1 : 0
+  name                      = local.name.peer_spoke_to_hub
+  resource_group_name       = local.network_rg_name
+  virtual_network_name      = azurerm_virtual_network.spoke.name
+  remote_virtual_network_id = azurerm_virtual_network.hub.id
+
+  allow_virtual_network_access = true
+  allow_forwarded_traffic      = true
+  allow_gateway_transit        = false
+  use_remote_gateways          = local.peering_gateway_transit
+
+  depends_on = [azurerm_virtual_network_peering.hub_to_spoke]
+}
+
+resource "azurerm_virtual_network_peering" "hub_to_uat" {
+  count                     = var.enable_hub_spoke_peering ? 1 : 0
+  name                      = local.name.peer_hub_to_uat
+  resource_group_name       = local.hub_rg_name
+  virtual_network_name      = azurerm_virtual_network.hub.name
+  remote_virtual_network_id = azurerm_virtual_network.uat_spoke.id
+
+  allow_virtual_network_access = true
+  allow_forwarded_traffic      = true
+  allow_gateway_transit        = local.peering_gateway_transit
+  use_remote_gateways          = false
+
+  depends_on = [azurerm_virtual_network_gateway.vpn]
+}
+
+resource "azurerm_virtual_network_peering" "uat_to_hub" {
+  count                     = var.enable_hub_spoke_peering ? 1 : 0
+  name                      = local.name.peer_uat_to_hub
+  resource_group_name       = local.network_rg_name
+  virtual_network_name      = azurerm_virtual_network.uat_spoke.name
+  remote_virtual_network_id = azurerm_virtual_network.hub.id
+
+  allow_virtual_network_access = true
+  allow_forwarded_traffic      = true
+  allow_gateway_transit        = false
+  use_remote_gateways          = local.peering_gateway_transit
+
+  depends_on = [azurerm_virtual_network_peering.hub_to_uat]
+}
+
+############################################
+# 【Spoke 網路】Virtual Network - Spoke-VNET（正式環境）
 ############################################
 resource "azurerm_virtual_network" "spoke" {
   name                = local.name.spoke_vnet
@@ -205,7 +482,6 @@ resource "azurerm_virtual_network" "spoke" {
 
   tags = merge(local.network_tags, {
     ResourceType = "VirtualNetwork"
-    Tier         = "Spoke"
     Workload     = "Production"
   })
 }
@@ -243,8 +519,7 @@ resource "azurerm_subnet" "bastion" {
 }
 
 ############################################
-# 【網路】Virtual Network - UAT-Spoke-VNET（測試環境）
-#   UAT HR 工作負載的 VM 與 Private Endpoint 皆掛載於此
+# 【Spoke 網路】Virtual Network - UAT-Spoke-VNET（測試環境）
 ############################################
 resource "azurerm_virtual_network" "uat_spoke" {
   name                = local.name.uat_spoke_vnet
@@ -254,7 +529,6 @@ resource "azurerm_virtual_network" "uat_spoke" {
 
   tags = merge(local.uat_tags, {
     ResourceType = "VirtualNetwork"
-    Tier         = "Spoke"
     Workload     = "UAT"
   })
 }
@@ -275,7 +549,7 @@ resource "azurerm_subnet" "uat_pe" {
 }
 
 ############################################
-# 【網路】Network Security Group
+# 【Spoke 網路】Network Security Group
 ############################################
 resource "azurerm_network_security_group" "ap" {
   name                = local.name.ap_nsg
@@ -284,7 +558,7 @@ resource "azurerm_network_security_group" "ap" {
 
   tags = merge(local.network_tags, {
     ResourceType = "NetworkSecurityGroup"
-    Tier         = "Application"
+    SubnetTier   = "Application"
   })
 
   security_rule {
@@ -319,7 +593,7 @@ resource "azurerm_network_security_group" "db" {
 
   tags = merge(local.network_tags, {
     ResourceType = "NetworkSecurityGroup"
-    Tier         = "Database"
+    SubnetTier   = "Database"
   })
 
   # 僅允許 AP Subnet 連 SQL
@@ -359,7 +633,7 @@ resource "azurerm_subnet_network_security_group_association" "db" {
 }
 
 ############################################
-# 【網路】NAT Gateway
+# 【Spoke 網路】NAT Gateway
 ############################################
 resource "azurerm_public_ip" "nat" {
   name                = local.name.nat_pip
@@ -404,7 +678,7 @@ resource "azurerm_subnet_nat_gateway_association" "db" {
 }
 
 ############################################
-# 【網路】Bastion（Developer SKU：無公用 IP）
+# 【Spoke 網路】Bastion（Developer SKU：無公用 IP）
 #   1. Developer SKU 不需公用 IP，也不需 AzureBastionSubnet
 #   2. 不支援 VNet peering，僅能連線 Spoke-VNET 內的 VM
 #   3. 單一並行連線，且僅能透過 Azure 入口網站瀏覽器連線
@@ -429,7 +703,7 @@ resource "azurerm_bastion_host" "spoke" {
 }
 
 ############################################
-# 【網路】Private DNS Zone
+# 【Spoke 網路】Private DNS Zone
 #   名稱由 Azure Private Link 規範固定，絕對不可加前綴
 #   PROD 與 UAT VNet 皆連結至同一組 Zone
 ############################################
@@ -463,6 +737,19 @@ resource "azurerm_private_dns_zone_virtual_network_link" "blob_uat" {
   registration_enabled  = false
 
   tags = merge(local.uat_tags, {
+    ResourceType = "PrivateDnsZoneLink"
+  })
+}
+
+resource "azurerm_private_dns_zone_virtual_network_link" "blob_hub" {
+  count                 = var.enable_hub_spoke_peering ? 1 : 0
+  name                  = "${local.prefix}link-hub-vnet"
+  resource_group_name   = local.network_rg_name
+  private_dns_zone_name = azurerm_private_dns_zone.blob.name
+  virtual_network_id    = azurerm_virtual_network.hub.id
+  registration_enabled  = false
+
+  tags = merge(local.hub_tags, {
     ResourceType = "PrivateDnsZoneLink"
   })
 }
@@ -501,8 +788,21 @@ resource "azurerm_private_dns_zone_virtual_network_link" "sql_uat" {
   })
 }
 
+resource "azurerm_private_dns_zone_virtual_network_link" "sql_hub" {
+  count                 = var.enable_hub_spoke_peering ? 1 : 0
+  name                  = "${local.prefix}link-hub-vnet"
+  resource_group_name   = local.network_rg_name
+  private_dns_zone_name = azurerm_private_dns_zone.sql.name
+  virtual_network_id    = azurerm_virtual_network.hub.id
+  registration_enabled  = false
+
+  tags = merge(local.hub_tags, {
+    ResourceType = "PrivateDnsZoneLink"
+  })
+}
+
 ############################################
-# 【網路】Activity Log Alert（location 固定 global）
+# 【Spoke 網路】Activity Log Alert（location 固定 global）
 ############################################
 resource "azurerm_monitor_activity_log_alert" "nsg_write" {
   name                = local.name.alert_nsg_write
@@ -589,7 +889,7 @@ resource "azurerm_lb" "hr" {
 
   tags = merge(local.hr_tags, {
     ResourceType = "LoadBalancer"
-    Tier         = "Application"
+    SubnetTier   = "Application"
   })
 
   frontend_ip_configuration {
@@ -665,7 +965,7 @@ resource "azurerm_windows_virtual_machine" "vm" {
 
   tags = merge(local.hr_tags, {
     ResourceType = "VirtualMachine"
-    Tier         = "Application"
+    SubnetTier   = "Application"
   })
 
   identity {
@@ -689,7 +989,7 @@ resource "azurerm_windows_virtual_machine" "vm" {
 
 ############################################
 # 【PROD HR】Azure SQL + Private Endpoint
-#   PE 掛在網路層的 PrivateEndpoint-Subnet，
+#   PE 掛在 Spoke 網路層的 PrivateEndpoint-Subnet，
 #   DNS 直接綁定網路層建立的 privatelink.database.windows.net
 ############################################
 resource "azurerm_mssql_server" "hr" {
@@ -704,7 +1004,7 @@ resource "azurerm_mssql_server" "hr" {
 
   tags = merge(local.hr_tags, {
     ResourceType = "SqlServer"
-    Tier         = "Database"
+    SubnetTier   = "Database"
   })
 }
 
@@ -716,7 +1016,7 @@ resource "azurerm_mssql_database" "hr" {
 
   tags = merge(local.hr_tags, {
     ResourceType = "SqlDatabase"
-    Tier         = "Database"
+    SubnetTier   = "Database"
   })
 }
 
@@ -868,8 +1168,6 @@ resource "azurerm_monitor_metric_alert" "sql_dtu" {
 
 ############################################
 # 【UAT HR】虛擬機器（雙網卡，掛載 UAT-Spoke-VNET 的 Workload-Subnet）
-#   原 2_main 以 data source 沿用既有網路，
-#   合併後改為直接參照本組態建立的 UAT 網路資源。
 ############################################
 resource "azurerm_network_interface" "uat_vm_primary" {
   name                = local.name.uat_nic_primary
@@ -922,7 +1220,7 @@ resource "azurerm_windows_virtual_machine" "uat_vm" {
 
   tags = merge(local.uat_hr_tags, {
     ResourceType = "VirtualMachine"
-    Tier         = "Application"
+    SubnetTier   = "Application"
   })
 
   os_disk {
@@ -939,7 +1237,7 @@ resource "azurerm_windows_virtual_machine" "uat_vm" {
   }
 }
 
-# 原組態的第二顆磁碟：容量與 LUN 以變數控制
+# 第二顆磁碟：容量以變數控制
 resource "azurerm_managed_disk" "uat_vm_data" {
   name                 = local.name.uat_data_disk
   location             = local.uat_hr_rg_location
@@ -975,7 +1273,7 @@ resource "azurerm_mssql_server" "uat_hr" {
 
   tags = merge(local.uat_hr_tags, {
     ResourceType = "SqlServer"
-    Tier         = "Database"
+    SubnetTier   = "Database"
   })
 }
 
@@ -987,7 +1285,7 @@ resource "azurerm_mssql_database" "uat_hr" {
 
   tags = merge(local.uat_hr_tags, {
     ResourceType = "SqlDatabase"
-    Tier         = "Database"
+    SubnetTier   = "Database"
   })
 }
 

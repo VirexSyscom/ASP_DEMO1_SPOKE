@@ -1,7 +1,7 @@
 ############################################
 # outputs.tf
-#   合併自 1_outputs / 2_outputs
-#   統一格式：共用驗證 → 資源群組 → 網路層 → PROD HR → UAT HR
+#   整合自 1_outputs / 2_output
+#   統一格式：共用驗證 → 資源群組 → Hub 網路 → Spoke 網路 → PROD HR → UAT HR
 ############################################
 
 ############################################
@@ -22,8 +22,13 @@ output "common_tags" {
   value       = local.common_tags
 }
 
+output "hub_tags_applied" {
+  description = "Hub 網路資源群組套用的標籤"
+  value       = local.hub_tags
+}
+
 output "network_tags_applied" {
-  description = "網路資源群組套用的標籤"
+  description = "Spoke 網路資源群組套用的標籤"
   value       = local.network_tags
 }
 
@@ -38,11 +43,12 @@ output "uat_hr_tags_applied" {
 }
 
 ############################################
-# 資源群組（三個獨立 RG）
+# 資源群組（四個獨立 RG）
 ############################################
 output "resource_groups" {
-  description = "本組態管理的三個資源群組"
+  description = "本組態管理的四個資源群組"
   value = {
+    hub     = local.hub_rg_name
     network = local.network_rg_name
     hr      = local.hr_rg_name
     uat_hr  = local.uat_hr_rg_name
@@ -50,7 +56,58 @@ output "resource_groups" {
 }
 
 ############################################
-# 網路層
+# Hub 網路層
+############################################
+output "hub_vnet" {
+  description = "Hub VNet 資訊"
+  value = {
+    id   = azurerm_virtual_network.hub.id
+    name = azurerm_virtual_network.hub.name
+  }
+}
+
+output "hub_bastion" {
+  description = "Hub Bastion 資訊"
+  value = {
+    id        = try(azurerm_bastion_host.hub[0].id, null)
+    sku       = try(azurerm_bastion_host.hub[0].sku, null)
+    public_ip = try(azurerm_public_ip.hub_bastion[0].ip_address, null)
+  }
+}
+
+output "vpn_gateway" {
+  description = "VPN Gateway 與 Local Network Gateway 資訊"
+  value = {
+    id                       = try(azurerm_virtual_network_gateway.vpn[0].id, null)
+    public_ip                = try(azurerm_public_ip.vpn_gateway[0].ip_address, null)
+    sku                      = try(azurerm_virtual_network_gateway.vpn[0].sku, null)
+    local_network_gateway_id = try(azurerm_local_network_gateway.fortigate[0].id, null)
+  }
+}
+
+output "vpn_connection" {
+  description = "Site-to-Site VPN Connection 資訊"
+  value = {
+    created = var.create_vpn_gateway && var.create_vpn_connection
+    id      = try(azurerm_virtual_network_gateway_connection.fortigate[0].id, null)
+    name    = try(azurerm_virtual_network_gateway_connection.fortigate[0].name, null)
+  }
+}
+
+output "hub_spoke_peering" {
+  description = "Hub 與 Spoke 之間的 VNet Peering 狀態"
+  value = {
+    enabled          = var.enable_hub_spoke_peering
+    gateway_transit  = local.peering_gateway_transit
+    hub_to_spoke_id  = try(azurerm_virtual_network_peering.hub_to_spoke[0].id, null)
+    spoke_to_hub_id  = try(azurerm_virtual_network_peering.spoke_to_hub[0].id, null)
+    hub_to_uat_id    = try(azurerm_virtual_network_peering.hub_to_uat[0].id, null)
+    uat_to_hub_id    = try(azurerm_virtual_network_peering.uat_to_hub[0].id, null)
+  }
+}
+
+############################################
+# Spoke 網路層
 ############################################
 output "spoke_vnet_id" {
   description = "PROD Spoke VNet 資源 ID"
@@ -65,12 +122,14 @@ output "uat_spoke_vnet_id" {
 output "subnet_ids" {
   description = "所有子網路資源 ID"
   value = {
-    ap      = azurerm_subnet.ap.id
-    db      = azurerm_subnet.db.id
-    pe      = azurerm_subnet.pe.id
-    bastion = var.create_bastion_subnet ? azurerm_subnet.bastion[0].id : null
-    uat     = azurerm_subnet.uat_workload.id
-    uat_pe  = azurerm_subnet.uat_pe.id
+    hub_bastion = var.create_hub_bastion ? azurerm_subnet.hub_bastion[0].id : null
+    gateway     = var.create_vpn_gateway ? azurerm_subnet.gateway[0].id : null
+    ap          = azurerm_subnet.ap.id
+    db          = azurerm_subnet.db.id
+    pe          = azurerm_subnet.pe.id
+    bastion     = var.create_bastion_subnet ? azurerm_subnet.bastion[0].id : null
+    uat         = azurerm_subnet.uat_workload.id
+    uat_pe      = azurerm_subnet.uat_pe.id
   }
 }
 
@@ -80,7 +139,7 @@ output "nat_gateway_public_ip" {
 }
 
 output "private_dns_zone_ids" {
-  description = "Private DNS Zone 資源 ID（PROD 與 UAT 共用）"
+  description = "Private DNS Zone 資源 ID（Hub / PROD / UAT 共用）"
   value = {
     blob = azurerm_private_dns_zone.blob.id
     sql  = azurerm_private_dns_zone.sql.id
@@ -88,17 +147,17 @@ output "private_dns_zone_ids" {
 }
 
 output "bastion_id" {
-  description = "Bastion Host 資源 ID"
+  description = "Spoke Bastion Host 資源 ID"
   value       = azurerm_bastion_host.spoke.id
 }
 
 output "bastion_sku" {
-  description = "實際部署的 Bastion SKU"
+  description = "Spoke 實際部署的 Bastion SKU"
   value       = azurerm_bastion_host.spoke.sku
 }
 
 output "bastion_access_model" {
-  description = "Bastion 連線方式說明"
+  description = "Spoke Bastion 連線方式說明"
   value       = var.bastion_sku == "Developer" ? "Developer SKU：無公用 IP，僅限 Azure 入口網站連線同一 VNet 內的 VM" : "使用公用 IP 連線"
 }
 
@@ -118,12 +177,12 @@ output "load_balancer_public_ip" {
 output "sql" {
   description = "PROD HR SQL 相關資源"
   value = {
-    server_name             = azurerm_mssql_server.hr.name
-    server_id               = azurerm_mssql_server.hr.id
-    server_fqdn             = azurerm_mssql_server.hr.fully_qualified_domain_name
-    database_id             = azurerm_mssql_database.hr.id
-    private_endpoint_id     = azurerm_private_endpoint.sql.id
-    private_endpoint_ip     = azurerm_private_endpoint.sql.private_service_connection[0].private_ip_address
+    server_name         = azurerm_mssql_server.hr.name
+    server_id           = azurerm_mssql_server.hr.id
+    server_fqdn         = azurerm_mssql_server.hr.fully_qualified_domain_name
+    database_id         = azurerm_mssql_database.hr.id
+    private_endpoint_id = azurerm_private_endpoint.sql.id
+    private_endpoint_ip = azurerm_private_endpoint.sql.private_service_connection[0].private_ip_address
   }
 }
 
@@ -187,8 +246,8 @@ output "uat_storage" {
 output "uat_monitoring" {
   description = "UAT HR 監控資源"
   value = {
-    action_group_id           = azurerm_monitor_action_group.uat_vm.id
-    vm_availability_alert_id  = azurerm_monitor_metric_alert.uat_vm_availability.id
-    sql_dtu_alert_id          = azurerm_monitor_metric_alert.uat_sql_dtu.id
+    action_group_id          = azurerm_monitor_action_group.uat_vm.id
+    vm_availability_alert_id = azurerm_monitor_metric_alert.uat_vm_availability.id
+    sql_dtu_alert_id         = azurerm_monitor_metric_alert.uat_sql_dtu.id
   }
 }

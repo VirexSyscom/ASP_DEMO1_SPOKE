@@ -1,9 +1,12 @@
 ############################################
 # variables.tf
-#   合併自 1_variables / 2_variables
-#   命名前綴、標籤、三個資源群組（網路 / PROD-HR / UAT-HR）
-#   全部統一為同一套變數命名規則：
+#   整合自 1_variables / 2_variables
+#   四個資源群組全部統一為同一套變數命名規則：
 #     <層>_resource_group_name / create_<層>_resource_group / <層>_tags
+#       hub     ：Hub 網路（VPN Gateway / Bastion）
+#       network ：Spoke 網路（PROD + UAT VNet）
+#       hr      ：PROD HR 工作負載
+#       uat_hr  ：UAT  HR 工作負載
 ############################################
 
 ############################################
@@ -19,7 +22,8 @@ variable "subscription_id" {
 }
 
 ############################################
-# 命名前綴（網路 / PROD-HR / UAT-HR 共用同一套規則）
+# 命名前綴（四層共用同一套規則）
+#   原 2_variables 的 resource_name_prefix 已統一為 name_prefix
 ############################################
 variable "name_prefix" {
   description = "所有資源名稱的前綴詞，例如 demo、hr、corp。留空則不加前綴。資源群組名稱不套用前綴。"
@@ -30,6 +34,7 @@ variable "name_prefix" {
     condition     = can(regex("^[a-zA-Z0-9-]*$", var.name_prefix))
     error_message = "name_prefix 僅能包含英數字與連字號。"
   }
+
   validation {
     condition     = length(var.name_prefix) <= 10
     error_message = "name_prefix 建議不超過 10 字元，避免資源名稱超出 Azure 長度限制。"
@@ -58,19 +63,29 @@ variable "location_short" {
 }
 
 ############################################
-# 資源群組（三個獨立 RG，名稱皆不套用前綴）
-#   1. 網路層      Spoke-Network-RG
-#   2. PROD HR 層  Spoke-HR-RG
-#   3. UAT  HR 層  UAT-Spoke-HR-RG
+# 資源群組（四個獨立 RG，名稱皆不套用前綴）
+#   原 2_main 的 Hub RG 會加前綴，整合後統一為「不加前綴、只加標籤」
 ############################################
+variable "hub_resource_group_name" {
+  description = "Hub 網路資源群組名稱（VPN Gateway / Hub Bastion 置於此）"
+  type        = string
+  default     = "Hub-Network-RG"
+}
+
+variable "create_hub_resource_group" {
+  description = "true = 由本組態建立 Hub RG；false = 沿用既有 RG"
+  type        = bool
+  default     = true
+}
+
 variable "network_resource_group_name" {
-  description = "網路資源群組名稱（Spoke 網路層，PROD 與 UAT VNet 皆置於此）"
+  description = "Spoke 網路資源群組名稱（PROD 與 UAT VNet 皆置於此）"
   type        = string
   default     = "Spoke-Network-RG"
 }
 
 variable "create_network_resource_group" {
-  description = "true = 由本組態建立網路 RG；false = 沿用既有 RG"
+  description = "true = 由本組態建立 Spoke 網路 RG；false = 沿用既有 RG"
   type        = bool
   default     = true
 }
@@ -131,8 +146,14 @@ variable "tags" {
   default     = {}
 }
 
+variable "hub_tags" {
+  description = "僅套用於 Hub 網路資源群組資源的額外標籤"
+  type        = map(string)
+  default     = {}
+}
+
 variable "network_tags" {
-  description = "僅套用於網路資源群組資源的額外標籤"
+  description = "僅套用於 Spoke 網路資源群組資源的額外標籤"
   type        = map(string)
   default     = {}
 }
@@ -150,7 +171,28 @@ variable "uat_hr_tags" {
 }
 
 ############################################
-# 網路位址
+# 網路位址 - Hub
+############################################
+variable "hub_vnet_address_space" {
+  description = "Hub VNet 位址空間"
+  type        = list(string)
+  default     = ["10.0.0.0/16"]
+}
+
+variable "hub_bastion_subnet_prefixes" {
+  description = "Hub AzureBastionSubnet CIDR，至少需 /26"
+  type        = list(string)
+  default     = ["10.0.0.0/26"]
+}
+
+variable "gateway_subnet_prefixes" {
+  description = "Hub GatewaySubnet CIDR，建議 /27 以上"
+  type        = list(string)
+  default     = ["10.0.1.0/27"]
+}
+
+############################################
+# 網路位址 - Spoke（PROD / UAT）
 ############################################
 variable "spoke_vnet_address_space" {
   description = "正式 Spoke VNet 位址空間"
@@ -183,7 +225,7 @@ variable "pe_subnet_prefix" {
 }
 
 variable "bastion_subnet_prefix" {
-  description = "AzureBastionSubnet 至少需 /26（僅在 create_bastion_subnet = true 時使用）"
+  description = "Spoke AzureBastionSubnet 至少需 /26（僅在 create_bastion_subnet = true 時使用）"
   type        = string
   default     = "10.10.250.0/26"
 }
@@ -202,9 +244,28 @@ variable "uat_pe_subnet_prefix" {
 
 ############################################
 # Bastion
+#   Hub  ：Basic/Standard/Premium，需 AzureBastionSubnet + 公用 IP
+#   Spoke：預設 Developer，免公用 IP、免 AzureBastionSubnet
 ############################################
+variable "hub_bastion_sku" {
+  description = "Hub Bastion SKU（Hub 為傳統模式，需公用 IP 與 AzureBastionSubnet）"
+  type        = string
+  default     = "Basic"
+
+  validation {
+    condition     = contains(["Basic", "Standard", "Premium"], var.hub_bastion_sku)
+    error_message = "hub_bastion_sku 必須為 Basic、Standard 或 Premium。"
+  }
+}
+
+variable "create_hub_bastion" {
+  description = "是否建立 Hub Bastion（含其 AzureBastionSubnet 與公用 IP）"
+  type        = bool
+  default     = true
+}
+
 variable "bastion_sku" {
-  description = "Bastion SKU。Developer 免公用 IP、免 AzureBastionSubnet，但不支援 VNet peering 與並行連線"
+  description = "Spoke Bastion SKU。Developer 免公用 IP、免 AzureBastionSubnet，但不支援 VNet peering 與並行連線"
   type        = string
   default     = "Developer"
 
@@ -215,7 +276,7 @@ variable "bastion_sku" {
 }
 
 variable "create_bastion_subnet" {
-  description = "是否建立 AzureBastionSubnet。Developer SKU 不需要，設為 false 可省去該子網路"
+  description = "是否建立 Spoke 的 AzureBastionSubnet。Developer SKU 不需要，設為 false 可省去該子網路"
   type        = bool
   default     = false
 
@@ -223,6 +284,89 @@ variable "create_bastion_subnet" {
     condition     = !(var.bastion_sku != "Developer" && var.create_bastion_subnet == false)
     error_message = "Basic/Standard/Premium SKU 必須建立 AzureBastionSubnet，請將 create_bastion_subnet 設為 true。"
   }
+}
+
+############################################
+# VPN Gateway / Site-to-Site（Hub）
+############################################
+variable "create_vpn_gateway" {
+  description = "是否建立 VPN Gateway（含 GatewaySubnet 與公用 IP）。建立時間約 30-45 分鐘。"
+  type        = bool
+  default     = true
+}
+
+variable "vpn_gateway_sku" {
+  description = "Azure VPN Gateway SKU"
+  type        = string
+  default     = "VpnGw2AZ"
+
+  validation {
+    condition = contains([
+      "Basic",
+      "VpnGw1", "VpnGw2", "VpnGw3", "VpnGw4", "VpnGw5",
+      "VpnGw1AZ", "VpnGw2AZ", "VpnGw3AZ", "VpnGw4AZ", "VpnGw5AZ"
+    ], var.vpn_gateway_sku)
+    error_message = "請指定有效的 VPN Gateway SKU。"
+  }
+}
+
+variable "vpn_gateway_public_ip_zones" {
+  description = "VPN Gateway Standard Public IP 的 Availability Zones"
+  type        = list(string)
+  default     = ["1", "2", "3"]
+}
+
+variable "enable_bgp" {
+  description = "是否於 Azure VPN Gateway 啟用 BGP"
+  type        = bool
+  default     = false
+}
+
+variable "onprem_vpn_public_ip" {
+  description = "地端 FortiGate 的公用 IP 位址"
+  type        = string
+  default     = "203.0.113.10"
+
+  validation {
+    condition     = can(cidrhost("${var.onprem_vpn_public_ip}/32", 0))
+    error_message = "onprem_vpn_public_ip 必須是有效的 IPv4 位址。"
+  }
+}
+
+variable "onprem_address_spaces" {
+  description = "FortiGate 後方的地端網段"
+  type        = list(string)
+  default     = ["192.168.0.0/16"]
+}
+
+variable "create_vpn_connection" {
+  description = "是否建立 Site-to-Site VPN Connection"
+  type        = bool
+  default     = false
+}
+
+variable "vpn_shared_key" {
+  description = "IPsec Pre-Shared Key。只有建立 VPN Connection 時才需要。"
+  type        = string
+  sensitive   = true
+  default     = null
+
+  validation {
+    condition = (
+      var.create_vpn_connection == false ||
+      (var.vpn_shared_key != null && length(trimspace(var.vpn_shared_key)) > 0)
+    )
+    error_message = "create_vpn_connection 為 true 時，必須提供非空白的 vpn_shared_key。"
+  }
+}
+
+############################################
+# Hub 與 Spoke 對等互連
+############################################
+variable "enable_hub_spoke_peering" {
+  description = "是否建立 Hub 與 PROD/UAT Spoke 之間的雙向 VNet Peering"
+  type        = bool
+  default     = true
 }
 
 ############################################
