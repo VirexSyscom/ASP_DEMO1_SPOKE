@@ -385,9 +385,12 @@ resource "azurerm_virtual_network_gateway" "vpn" {
   type          = "Vpn"
   vpn_type      = "RouteBased"
   active_active = false
-  enable_bgp    = var.enable_bgp
-  sku           = var.vpn_gateway_sku
-  generation    = "Generation2"
+
+  # azurerm 4.x：enable_bgp 已棄用並更名為 bgp_enabled，v5.0 將移除
+  bgp_enabled = var.enable_bgp
+
+  sku        = var.vpn_gateway_sku
+  generation = "Generation2"
 
   tags = merge(local.hub_tags, {
     ResourceType = "VirtualNetworkGateway"
@@ -433,7 +436,9 @@ resource "azurerm_virtual_network_gateway_connection" "fortigate" {
   virtual_network_gateway_id = azurerm_virtual_network_gateway.vpn[0].id
   local_network_gateway_id   = azurerm_local_network_gateway.fortigate[0].id
   shared_key                 = var.vpn_shared_key
-  enable_bgp                 = var.enable_bgp
+
+  # azurerm 4.x：enable_bgp 已棄用並更名為 bgp_enabled
+  bgp_enabled = var.enable_bgp
 
   tags = merge(local.hub_tags, {
     ResourceType = "VpnConnection"
@@ -1564,19 +1569,27 @@ resource "azurerm_recovery_services_vault" "migrate" {
 ############################################
 # 【遷移工具層 / AzureMigrateRG】Azure Migrate 專案
 #   對應入口網站：Migrate-HR（Azure Migrate）
-#   azurerm 未提供對應資源，改以 azapi 呼叫
-#   Microsoft.Migrate/migrateProjects@2023-01-01
+#
+#   azurerm 未提供對應資源，改以 azapi 呼叫。
+#   注意：Microsoft.Migrate/migrateProjects 在 japaneast 僅支援
+#         2018-09-01-preview / 2019-06-01 / 2020-05-01 / 2020-06-01-preview，
+#         使用 2023-01-01（那是 assessmentProjects 的版本）會回傳
+#         400 NoRegisteredProviderFound，故此處固定 2020-05-01。
+#
+#   部署前請確認訂閱已註冊 Provider：
+#     az provider register --namespace Microsoft.Migrate --wait
+#     az provider register --namespace Microsoft.OffAzure --wait
+#     az provider register --namespace Microsoft.DataMigration --wait
 ############################################
 resource "azapi_resource" "migrate_project" {
-  type      = "Microsoft.Migrate/migrateProjects@2023-01-01"
+  type      = "Microsoft.Migrate/migrateProjects@2020-05-01"
   name      = local.name.migrate_project
   location  = local.migrate_rg_location
   parent_id = local.migrate_rg_id
 
+  # 2020-05-01 的 schema 不支援 publicNetworkAccess，送空 properties 即可
   body = {
-    properties = {
-      publicNetworkAccess = var.migrate_project_public_network_access
-    }
+    properties = {}
   }
 
   tags = merge(local.migrate_tags, {
@@ -1737,9 +1750,22 @@ resource "azurerm_database_migration_service" "sql_to_azure_sql" {
 
 ############################################
 # 【遷移工具層】權限指派
-#   讓 Azure Migrate / RSV 的系統受控識別能寫入遷移記錄儲存體
+#   讓 RSV 的系統受控識別能寫入遷移記錄儲存體。
+#
+#   注意：Azure DevOps 服務連線的 SPN 通常僅具 Contributor，
+#         不含 Microsoft.Authorization/roleAssignments/write，
+#         直接建立會出現 403 AuthorizationFailed，故預設關閉
+#         （var.create_migrate_role_assignment = false）。
+#
+#   關閉時請由具權限的管理員手動指派一次：
+#     az role assignment create \
+#       --assignee-object-id <RSV 的 principalId> \
+#       --assignee-principal-type ServicePrincipal \
+#       --role "Storage Blob Data Contributor" \
+#       --scope <遷移儲存體帳戶的資源 ID>
 ############################################
 resource "azurerm_role_assignment" "vault_to_migrate_storage" {
+  count                = var.create_migrate_role_assignment ? 1 : 0
   scope                = azurerm_storage_account.migrate.id
   role_definition_name = "Storage Blob Data Contributor"
   principal_id         = azurerm_recovery_services_vault.migrate.identity[0].principal_id

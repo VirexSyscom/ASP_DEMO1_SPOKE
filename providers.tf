@@ -41,7 +41,7 @@ provider "azurerm" {
     #   vm_backup_stop_protection_and_retain_data_on_destroy
     #   vm_backup_suspend_protection_and_retain_data_on_destroy
     # 必須「擇一」明確指定（ExactlyOneOf），否則 plan 會出現
-    # 「Invalid combination of arguments」。兩個都填也會報錯。
+    # 「Invalid combination of arguments」。兩個都填同樣會報錯。
     recovery_service {
       vm_backup_stop_protection_and_retain_data_on_destroy = false
       purge_protected_items_from_vault_on_destroy          = false

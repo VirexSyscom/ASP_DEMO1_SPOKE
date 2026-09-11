@@ -87,6 +87,7 @@ output "vpn_gateway" {
     id                       = try(azurerm_virtual_network_gateway.vpn[0].id, null)
     public_ip                = try(azurerm_public_ip.vpn_gateway[0].ip_address, null)
     sku                      = try(azurerm_virtual_network_gateway.vpn[0].sku, null)
+    bgp_enabled              = try(azurerm_virtual_network_gateway.vpn[0].bgp_enabled, null)
     local_network_gateway_id = try(azurerm_local_network_gateway.fortigate[0].id, null)
   }
 }
@@ -274,7 +275,7 @@ output "migrate_recovery_vault" {
 }
 
 output "migrate_project" {
-  description = "Azure Migrate 專案（對應 Migrate-HR）"
+  description = "Azure Migrate 專案（對應 Migrate-HR，API 版本 2020-05-01）"
   value = {
     name = azapi_resource.migrate_project.name
     id   = azapi_resource.migrate_project.id
@@ -309,5 +310,16 @@ output "database_migration_service" {
     id        = try(azurerm_database_migration_service.sql_to_azure_sql[0].id, null)
     sku       = try(azurerm_database_migration_service.sql_to_azure_sql[0].sku_name, null)
     subnet_id = try(azurerm_subnet.migrate[0].id, null)
+  }
+}
+
+output "migrate_role_assignment" {
+  description = "RSV 對遷移儲存體的角色指派狀態；false 時需由管理員手動指派"
+  value = {
+    managed_by_terraform = var.create_migrate_role_assignment
+    id                   = try(azurerm_role_assignment.vault_to_migrate_storage[0].id, null)
+    principal_id         = azurerm_recovery_services_vault.migrate.identity[0].principal_id
+    scope                = azurerm_storage_account.migrate.id
+    role                 = "Storage Blob Data Contributor"
   }
 }

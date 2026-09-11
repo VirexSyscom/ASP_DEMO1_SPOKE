@@ -92,7 +92,7 @@ uat_spoke_vnet_address_space = ["10.20.0.0/16"]
 ap_subnet_prefix           = "10.10.1.0/24"
 db_subnet_prefix           = "10.10.2.0/24"
 pe_subnet_prefix           = "10.10.3.0/24"
-migrate_subnet_prefix      = "10.10.4.0/24" # DMS 專用，建於既有 Spoke-VNET
+migrate_subnet_prefix      = "10.10.4.0/24"   # DMS 專用，建於既有 Spoke-VNET
 bastion_subnet_prefix      = "10.10.250.0/26" # Developer SKU 下不會被使用
 uat_workload_subnet_prefix = "10.20.1.0/24"
 uat_pe_subnet_prefix       = "10.20.2.0/24"
@@ -164,15 +164,14 @@ create_uat_eventgrid_system_topic = true
 ############################################
 # 遷移工具層（AzureMigrateRG）
 #   對應入口網站六項資源：
-#     Migrate-HR                 -> Azure Migrate 專案
+#     Migrate-HR                 -> Azure Migrate 專案（azapi 2020-05-01）
 #     discovervmware4949vault    -> 復原服務保存庫
 #     Migrate-HR8786kv           -> 金鑰保存庫
 #     migratelog                 -> 儲存體帳戶
 #     migratelog-<guid>          -> 事件方格系統主題
 #     SQLtoAzureSQL              -> Database Migration Service
 ############################################
-migrate_project_name                  = "Migrate-HR"
-migrate_project_public_network_access = "Enabled"
+migrate_project_name = "Migrate-HR"
 
 recovery_vault_name                = "discovervmware"
 recovery_vault_sku                 = "Standard"
@@ -188,6 +187,11 @@ migrate_storage_name                          = "migratelog"
 migrate_storage_replication_type              = "LRS"
 migrate_storage_public_network_access_enabled = false
 create_migrate_eventgrid_system_topic         = true
+
+# Azure DevOps 服務連線的 SPN 若僅有 Contributor，必須維持 false，
+# 否則會出現 403 AuthorizationFailed（roleAssignments/write）。
+# SPN 具備 Role Based Access Control Administrator 時才可改為 true。
+create_migrate_role_assignment = false
 
 create_database_migration_service = true
 database_migration_service_name   = "SQLtoAzureSQL"

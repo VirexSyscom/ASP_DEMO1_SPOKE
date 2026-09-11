@@ -6,7 +6,7 @@
 #       network ：Spoke 網路（PROD + UAT VNet）
 #       hr      ：PROD HR 工作負載
 #       uat_hr  ：UAT  HR 工作負載
-#       migrate ：AzureMigrateRG 遷移工具層（新增）
+#       migrate ：AzureMigrateRG 遷移工具層
 ############################################
 
 ############################################
@@ -341,7 +341,7 @@ variable "vpn_gateway_public_ip_zones" {
 }
 
 variable "enable_bgp" {
-  description = "是否於 Azure VPN Gateway 啟用 BGP"
+  description = "是否於 Azure VPN Gateway 啟用 BGP（對應資源參數已改用 bgp_enabled）"
   type        = bool
   default     = false
 }
@@ -501,7 +501,10 @@ variable "create_uat_eventgrid_system_topic" {
 }
 
 ############################################
-# 【新增】遷移層：Azure Migrate 專案
+# 遷移層：Azure Migrate 專案
+#   注意：Microsoft.Migrate/migrateProjects 在 japaneast 僅支援
+#   2018-09-01-preview / 2019-06-01 / 2020-05-01 / 2020-06-01-preview，
+#   本組態固定使用 2020-05-01（詳見 main.tf）。
 ############################################
 variable "migrate_project_name" {
   description = "Azure Migrate 專案基底名稱（實際名稱會自動加上前綴）"
@@ -509,19 +512,8 @@ variable "migrate_project_name" {
   default     = "Migrate-HR"
 }
 
-variable "migrate_project_public_network_access" {
-  description = "Azure Migrate 專案是否允許公用網路存取"
-  type        = string
-  default     = "Enabled"
-
-  validation {
-    condition     = contains(["Enabled", "Disabled"], var.migrate_project_public_network_access)
-    error_message = "migrate_project_public_network_access 必須為 Enabled 或 Disabled。"
-  }
-}
-
 ############################################
-# 【新增】遷移層：Recovery Services Vault
+# 遷移層：Recovery Services Vault
 ############################################
 variable "recovery_vault_name" {
   description = "復原服務保存庫基底名稱（實際名稱會自動加上前綴與亂數後綴）"
@@ -558,7 +550,7 @@ variable "recovery_vault_soft_delete_enabled" {
 }
 
 ############################################
-# 【新增】遷移層：Key Vault
+# 遷移層：Key Vault
 ############################################
 variable "migrate_key_vault_name" {
   description = "遷移層 Key Vault 基底名稱（實際名稱會自動加上前綴與亂數後綴）"
@@ -590,7 +582,7 @@ variable "migrate_key_vault_purge_protection_enabled" {
 }
 
 ############################################
-# 【新增】遷移層：儲存體（migratelog）
+# 遷移層：儲存體（migratelog）
 ############################################
 variable "migrate_storage_name" {
   description = "遷移記錄儲存體帳戶基底名稱（實際名稱會自動加上緊湊前綴與亂數後綴）"
@@ -617,7 +609,21 @@ variable "create_migrate_eventgrid_system_topic" {
 }
 
 ############################################
-# 【新增】遷移層：Database Migration Service
+# 遷移層：角色指派
+#   Azure DevOps 服務連線通常僅具 Contributor，
+#   不含 Microsoft.Authorization/roleAssignments/write，
+#   會導致 403 AuthorizationFailed，故預設關閉。
+#   若 SPN 具 Role Based Access Control Administrator
+#   或 User Access Administrator，可改為 true。
+############################################
+variable "create_migrate_role_assignment" {
+  description = "是否由 Terraform 建立 RSV 對遷移儲存體的角色指派。SPN 需具備 RBAC 管理權限才能設為 true。"
+  type        = bool
+  default     = false
+}
+
+############################################
+# 遷移層：Database Migration Service
 ############################################
 variable "create_database_migration_service" {
   description = "是否建立 Azure Database Migration Service（傳統版 DMS 已宣告淘汰，新專案建議改用 Azure SQL 移轉延伸模組）"
