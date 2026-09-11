@@ -1,13 +1,14 @@
 ############################################
 # main.tf
-#   整合自 1_main（Spoke 網路 + PROD HR + UAT HR）與 2_main（Hub 網路 + VPN）
+#   Hub 網路 + Spoke 網路 + PROD HR + UAT HR + 遷移工具層（AzureMigrateRG）
 #
 #   統一格式：
 #     1. 命名一律經由 local.name 統一表，套用 local.prefix 前綴
 #     2. 標籤一律以 merge(local.<層>_tags, { ResourceType = ... }) 產生
-#     3. 四個資源群組獨立保留：Hub 網路 / Spoke 網路 / PROD HR / UAT HR
+#     3. 五個資源群組獨立保留：Hub 網路 / Spoke 網路 / PROD HR / UAT HR / AzureMigrateRG
 #        RG 名稱一律不套用前綴，但標籤一律套用
 #     4. 每個 RG 皆支援 create_<層>_resource_group 切換「新建 / 沿用既有」
+#     5. 遷移層不另建 VNet，一律沿用既有的 PROD Spoke-VNET
 ############################################
 
 data "azurerm_client_config" "current" {}
@@ -46,6 +47,7 @@ locals {
     pe_subnet        = "${local.prefix}PrivateEndpoint-Subnet"
     uat_subnet       = "${local.prefix}Workload-Subnet"
     uat_pe_subnet    = "${local.prefix}UAT-PrivateEndpoint-Subnet"
+    migrate_subnet   = "${local.prefix}Migrate-Subnet"
     bastion_subnet   = "AzureBastionSubnet" # Azure 保留名稱，不可加前綴
     ap_nsg           = "${local.prefix}AP-Subnet-NSG"
     db_nsg           = "${local.prefix}DB-Subnet-NSG"
@@ -87,6 +89,19 @@ locals {
     uat_eventgrid      = "${local.prefix}uat-syscom-topic"
     uat_ag_vm          = "${local.prefix}uat-vm-actiongroup"
     uat_alert_vm_avail = "${local.prefix}uat-vm-availability"
+
+    # ===== 遷移工具層（AzureMigrateRG）=====
+    # 對應入口網站清單：
+    #   discovervmware4949vault / Migrate-HR / Migrate-HR8786kv
+    #   migratelog / migratelog-<guid> / SQLtoAzureSQL
+    migrate_project   = "${local.prefix}${var.migrate_project_name}"
+    recovery_vault    = "${local.prefix}${var.recovery_vault_name}${random_string.migrate_suffix.result}vault"
+    migrate_kv        = substr("${local.prefix_compact}${var.migrate_key_vault_name}${random_string.migrate_suffix.result}kv", 0, 24)
+    migrate_storage   = substr("${local.prefix_compact}${lower(var.migrate_storage_name)}${random_string.migrate_suffix.result}", 0, 24)
+    migrate_kv_pe     = "${local.prefix}${var.migrate_key_vault_name}-kv-pe"
+    migrate_blob_pe   = "${local.prefix}${var.migrate_storage_name}-blob-pe"
+    migrate_eventgrid = "${local.prefix}${var.migrate_storage_name}-topic"
+    dms               = "${local.prefix}${var.database_migration_service_name}"
   }
 
   # ---------- 統一標籤 ----------
@@ -113,6 +128,9 @@ locals {
   # UAT HR 工作負載：沿用 HR 標籤但改寫 Environment
   uat_hr_tags = merge(local.hr_tags, { Environment = "uat" }, var.uat_hr_tags)
 
+  # 遷移工具層
+  migrate_tags = merge(local.common_tags, { Layer = "Migration", Workload = "AzureMigrate" }, var.migrate_tags)
+
   # ---------- 資源群組解析 ----------
   hub_rg_name     = var.create_hub_resource_group ? azurerm_resource_group.hub[0].name : data.azurerm_resource_group.hub_existing[0].name
   hub_rg_location = var.create_hub_resource_group ? azurerm_resource_group.hub[0].location : data.azurerm_resource_group.hub_existing[0].location
@@ -125,6 +143,10 @@ locals {
 
   uat_hr_rg_name     = var.create_uat_hr_resource_group ? azurerm_resource_group.uat_hr[0].name : data.azurerm_resource_group.uat_hr_existing[0].name
   uat_hr_rg_location = var.create_uat_hr_resource_group ? azurerm_resource_group.uat_hr[0].location : data.azurerm_resource_group.uat_hr_existing[0].location
+
+  migrate_rg_name     = var.create_migrate_resource_group ? azurerm_resource_group.migrate[0].name : data.azurerm_resource_group.migrate_existing[0].name
+  migrate_rg_location = var.create_migrate_resource_group ? azurerm_resource_group.migrate[0].location : data.azurerm_resource_group.migrate_existing[0].location
+  migrate_rg_id       = var.create_migrate_resource_group ? azurerm_resource_group.migrate[0].id : data.azurerm_resource_group.migrate_existing[0].id
 
   subscription_id = data.azurerm_client_config.current.subscription_id
   alert_scope     = "/subscriptions/${data.azurerm_client_config.current.subscription_id}"
@@ -169,12 +191,24 @@ resource "random_string" "uat_storage_suffix" {
   }
 }
 
+# 遷移層共用後綴（RSV / Key Vault / Storage 皆需全域唯一）
+resource "random_string" "migrate_suffix" {
+  length  = 4
+  upper   = false
+  special = false
+
+  keepers = {
+    prefix = local.prefix
+  }
+}
+
 ############################################
-# 資源群組（四個獨立 RG，名稱皆不套用前綴，但一律套用統一標籤）
+# 資源群組（五個獨立 RG，名稱皆不套用前綴，但一律套用統一標籤）
 #   1. Hub 網路    var.hub_resource_group_name
 #   2. Spoke 網路  var.network_resource_group_name
 #   3. PROD HR     var.hr_resource_group_name
 #   4. UAT  HR     var.uat_hr_resource_group_name
+#   5. 遷移工具    var.migrate_resource_group_name（AzureMigrateRG）
 ############################################
 data "azurerm_resource_group" "hub_existing" {
   count = var.create_hub_resource_group ? 0 : 1
@@ -232,6 +266,21 @@ resource "azurerm_resource_group" "uat_hr" {
   location = var.location
 
   tags = merge(local.uat_hr_tags, {
+    ResourceType = "ResourceGroup"
+  })
+}
+
+data "azurerm_resource_group" "migrate_existing" {
+  count = var.create_migrate_resource_group ? 0 : 1
+  name  = var.migrate_resource_group_name
+}
+
+resource "azurerm_resource_group" "migrate" {
+  count    = var.create_migrate_resource_group ? 1 : 0
+  name     = var.migrate_resource_group_name
+  location = var.location
+
+  tags = merge(local.migrate_tags, {
     ResourceType = "ResourceGroup"
   })
 }
@@ -390,26 +439,10 @@ resource "azurerm_virtual_network_gateway_connection" "fortigate" {
     ResourceType = "VpnConnection"
     Purpose      = "Site-to-Site"
   })
-
-  # 若 FortiGate 有指定 IKE/IPsec Proposal，可取消下面區塊註解，
-  # 並依 FortiGate Phase 1 / Phase 2 設定調整。
-  #
-  # ipsec_policy {
-  #   dh_group         = "DHGroup14"
-  #   ike_encryption   = "AES256"
-  #   ike_integrity    = "SHA256"
-  #   ipsec_encryption = "AES256"
-  #   ipsec_integrity  = "SHA256"
-  #   pfs_group        = "PFS14"
-  #   sa_datasize      = 102400000
-  #   sa_lifetime      = 27000
-  # }
 }
 
 ############################################
 # 【Hub <-> Spoke】VNet Peering
-#   注意：Spoke 端的 Bastion 若使用 Developer SKU，
-#         無法透過 peering 連線至其他 VNet 的 VM。
 ############################################
 resource "azurerm_virtual_network_peering" "hub_to_spoke" {
   count                     = var.enable_hub_spoke_peering ? 1 : 0
@@ -508,6 +541,19 @@ resource "azurerm_subnet" "pe" {
   private_endpoint_network_policies = "Disabled"
 }
 
+############################################
+# 【Spoke 網路】Migrate-Subnet
+#   Database Migration Service 需專屬委派子網路，
+#   建立在既有的 PROD Spoke-VNET，不另建 VNet。
+############################################
+resource "azurerm_subnet" "migrate" {
+  count                = var.create_database_migration_service ? 1 : 0
+  name                 = local.name.migrate_subnet
+  resource_group_name  = local.network_rg_name
+  virtual_network_name = azurerm_virtual_network.spoke.name
+  address_prefixes     = [var.migrate_subnet_prefix]
+}
+
 # Bastion 專用子網路，名稱為 Azure 保留字，不可加前綴
 # Developer SKU 不需要 AzureBastionSubnet，故為條件式建立
 resource "azurerm_subnet" "bastion" {
@@ -596,7 +642,7 @@ resource "azurerm_network_security_group" "db" {
     SubnetTier   = "Database"
   })
 
-  # 僅允許 AP Subnet 連 SQL
+  # 允許 AP Subnet 連 SQL
   security_rule {
     name                       = "Allow-SQL-From-AP"
     priority                   = 100
@@ -606,6 +652,19 @@ resource "azurerm_network_security_group" "db" {
     source_port_range          = "*"
     destination_port_range     = "1433"
     source_address_prefix      = var.ap_subnet_prefix
+    destination_address_prefix = "*"
+  }
+
+  # 允許 Migrate-Subnet（DMS）連 SQL
+  security_rule {
+    name                       = "Allow-SQL-From-Migrate"
+    priority                   = 110
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "1433"
+    source_address_prefix      = var.migrate_subnet_prefix
     destination_address_prefix = "*"
   }
 
@@ -677,12 +736,15 @@ resource "azurerm_subnet_nat_gateway_association" "db" {
   nat_gateway_id = azurerm_nat_gateway.spoke.id
 }
 
+# DMS 需對外連線 Azure 服務端點，沿用同一組 NAT Gateway 出口
+resource "azurerm_subnet_nat_gateway_association" "migrate" {
+  count          = var.create_database_migration_service ? 1 : 0
+  subnet_id      = azurerm_subnet.migrate[0].id
+  nat_gateway_id = azurerm_nat_gateway.spoke.id
+}
+
 ############################################
 # 【Spoke 網路】Bastion（Developer SKU：無公用 IP）
-#   1. Developer SKU 不需公用 IP，也不需 AzureBastionSubnet
-#   2. 不支援 VNet peering，僅能連線 Spoke-VNET 內的 VM
-#   3. 單一並行連線，且僅能透過 Azure 入口網站瀏覽器連線
-#   4. 微軟定位為 Dev/Test，不建議用於正式環境
 ############################################
 resource "azurerm_bastion_host" "spoke" {
   name                = local.name.bastion
@@ -690,7 +752,6 @@ resource "azurerm_bastion_host" "spoke" {
   resource_group_name = local.network_rg_name
   sku                 = var.bastion_sku
 
-  # Developer SKU 以 VNet 為範圍，不使用 ip_configuration / public_ip
   virtual_network_id = azurerm_virtual_network.spoke.id
   copy_paste_enabled = true
 
@@ -705,7 +766,8 @@ resource "azurerm_bastion_host" "spoke" {
 ############################################
 # 【Spoke 網路】Private DNS Zone
 #   名稱由 Azure Private Link 規範固定，絕對不可加前綴
-#   PROD 與 UAT VNet 皆連結至同一組 Zone
+#   PROD / UAT / Hub VNet 皆連結至同一組 Zone，
+#   遷移層的 Key Vault / Storage PE 也共用這些 Zone。
 ############################################
 resource "azurerm_private_dns_zone" "blob" {
   name                = "privatelink.blob.core.windows.net"
@@ -793,6 +855,42 @@ resource "azurerm_private_dns_zone_virtual_network_link" "sql_hub" {
   name                  = "${local.prefix}link-hub-vnet"
   resource_group_name   = local.network_rg_name
   private_dns_zone_name = azurerm_private_dns_zone.sql.name
+  virtual_network_id    = azurerm_virtual_network.hub.id
+  registration_enabled  = false
+
+  tags = merge(local.hub_tags, {
+    ResourceType = "PrivateDnsZoneLink"
+  })
+}
+
+# 遷移層 Key Vault Private Endpoint 專用 Zone（同樣置於 Spoke 網路 RG）
+resource "azurerm_private_dns_zone" "keyvault" {
+  name                = "privatelink.vaultcore.azure.net"
+  resource_group_name = local.network_rg_name
+
+  tags = merge(local.network_tags, {
+    ResourceType = "PrivateDnsZone"
+    Service      = "KeyVault"
+  })
+}
+
+resource "azurerm_private_dns_zone_virtual_network_link" "keyvault_spoke" {
+  name                  = "${local.prefix}link-spoke-vnet"
+  resource_group_name   = local.network_rg_name
+  private_dns_zone_name = azurerm_private_dns_zone.keyvault.name
+  virtual_network_id    = azurerm_virtual_network.spoke.id
+  registration_enabled  = false
+
+  tags = merge(local.network_tags, {
+    ResourceType = "PrivateDnsZoneLink"
+  })
+}
+
+resource "azurerm_private_dns_zone_virtual_network_link" "keyvault_hub" {
+  count                 = var.enable_hub_spoke_peering ? 1 : 0
+  name                  = "${local.prefix}link-hub-vnet"
+  resource_group_name   = local.network_rg_name
+  private_dns_zone_name = azurerm_private_dns_zone.keyvault.name
   virtual_network_id    = azurerm_virtual_network.hub.id
   registration_enabled  = false
 
@@ -989,8 +1087,6 @@ resource "azurerm_windows_virtual_machine" "vm" {
 
 ############################################
 # 【PROD HR】Azure SQL + Private Endpoint
-#   PE 掛在 Spoke 網路層的 PrivateEndpoint-Subnet，
-#   DNS 直接綁定網路層建立的 privatelink.database.windows.net
 ############################################
 resource "azurerm_mssql_server" "hr" {
   name                          = local.name.sql_server
@@ -1237,7 +1333,6 @@ resource "azurerm_windows_virtual_machine" "uat_vm" {
   }
 }
 
-# 第二顆磁碟：容量以變數控制
 resource "azurerm_managed_disk" "uat_vm_data" {
   name                 = local.name.uat_data_disk
   location             = local.uat_hr_rg_location
@@ -1439,4 +1534,213 @@ resource "azurerm_monitor_metric_alert" "uat_sql_dtu" {
   action {
     action_group_id = azurerm_monitor_action_group.uat_vm.id
   }
+}
+
+############################################
+# 【遷移工具層 / AzureMigrateRG】復原服務保存庫
+#   對應入口網站：discovervmware4949vault（復原服務保存庫）
+#   供 Azure Migrate 的 VMware 探索與伺服器移轉使用
+############################################
+resource "azurerm_recovery_services_vault" "migrate" {
+  name                = local.name.recovery_vault
+  location            = local.migrate_rg_location
+  resource_group_name = local.migrate_rg_name
+  sku                 = var.recovery_vault_sku
+  storage_mode_type   = var.recovery_vault_storage_mode
+  soft_delete_enabled = var.recovery_vault_soft_delete_enabled
+
+  public_network_access_enabled = true
+
+  identity {
+    type = "SystemAssigned"
+  }
+
+  tags = merge(local.migrate_tags, {
+    ResourceType = "RecoveryServicesVault"
+    Purpose      = "VMware-Discovery-Migration"
+  })
+}
+
+############################################
+# 【遷移工具層 / AzureMigrateRG】Azure Migrate 專案
+#   對應入口網站：Migrate-HR（Azure Migrate）
+#   azurerm 未提供對應資源，改以 azapi 呼叫
+#   Microsoft.Migrate/migrateProjects@2023-01-01
+############################################
+resource "azapi_resource" "migrate_project" {
+  type      = "Microsoft.Migrate/migrateProjects@2023-01-01"
+  name      = local.name.migrate_project
+  location  = local.migrate_rg_location
+  parent_id = local.migrate_rg_id
+
+  body = {
+    properties = {
+      publicNetworkAccess = var.migrate_project_public_network_access
+    }
+  }
+
+  tags = merge(local.migrate_tags, {
+    ResourceType = "MigrateProject"
+    Purpose      = "Assessment-And-Migration"
+  })
+
+  schema_validation_enabled = false
+}
+
+############################################
+# 【遷移工具層 / AzureMigrateRG】Key Vault + Private Endpoint
+#   對應入口網站：Migrate-HR8786kv（金鑰保存庫）
+#   供 Azure Migrate / DMS 保存移轉憑證與連線字串
+############################################
+resource "azurerm_key_vault" "migrate" {
+  name                = local.name.migrate_kv
+  location            = local.migrate_rg_location
+  resource_group_name = local.migrate_rg_name
+  tenant_id           = data.azurerm_client_config.current.tenant_id
+  sku_name            = var.migrate_key_vault_sku
+
+  enable_rbac_authorization     = true
+  purge_protection_enabled      = var.migrate_key_vault_purge_protection_enabled
+  soft_delete_retention_days    = 7
+  public_network_access_enabled = var.migrate_key_vault_public_network_access_enabled
+
+  network_acls {
+    bypass         = "AzureServices"
+    default_action = var.migrate_key_vault_public_network_access_enabled ? "Allow" : "Deny"
+  }
+
+  tags = merge(local.migrate_tags, {
+    ResourceType = "KeyVault"
+    Purpose      = "Migration-Secrets"
+  })
+}
+
+resource "azurerm_private_endpoint" "migrate_kv" {
+  count               = var.migrate_key_vault_public_network_access_enabled ? 0 : 1
+  name                = local.name.migrate_kv_pe
+  location            = local.migrate_rg_location
+  resource_group_name = local.migrate_rg_name
+
+  # 沿用原本的 PROD Spoke-VNET PrivateEndpoint-Subnet
+  subnet_id = azurerm_subnet.pe.id
+
+  tags = merge(local.migrate_tags, {
+    ResourceType = "PrivateEndpoint"
+    Service      = "KeyVault"
+  })
+
+  private_service_connection {
+    name                           = "${local.prefix}migrate-kv-connection"
+    private_connection_resource_id = azurerm_key_vault.migrate.id
+    subresource_names              = ["vault"]
+    is_manual_connection           = false
+  }
+
+  private_dns_zone_group {
+    name                 = "${local.prefix}migrate-kv-private-dns"
+    private_dns_zone_ids = [azurerm_private_dns_zone.keyvault.id]
+  }
+}
+
+############################################
+# 【遷移工具層 / AzureMigrateRG】儲存體 + Private Endpoint + Event Grid
+#   對應入口網站：
+#     migratelog（儲存體帳戶）
+#     migratelog-<guid>（事件方格系統主題）
+############################################
+resource "azurerm_storage_account" "migrate" {
+  name                          = local.name.migrate_storage
+  resource_group_name           = local.migrate_rg_name
+  location                      = local.migrate_rg_location
+  account_tier                  = "Standard"
+  account_replication_type      = var.migrate_storage_replication_type
+  account_kind                  = "StorageV2"
+  min_tls_version               = "TLS1_2"
+  https_traffic_only_enabled    = true
+  public_network_access_enabled = var.migrate_storage_public_network_access_enabled
+
+  tags = merge(local.migrate_tags, {
+    ResourceType = "StorageAccount"
+    Service      = "Storage-Blob"
+    Purpose      = "Migration-Logs"
+  })
+}
+
+resource "azurerm_private_endpoint" "migrate_blob" {
+  count               = var.migrate_storage_public_network_access_enabled ? 0 : 1
+  name                = local.name.migrate_blob_pe
+  location            = local.migrate_rg_location
+  resource_group_name = local.migrate_rg_name
+
+  # 沿用原本的 PROD Spoke-VNET PrivateEndpoint-Subnet
+  subnet_id = azurerm_subnet.pe.id
+
+  tags = merge(local.migrate_tags, {
+    ResourceType = "PrivateEndpoint"
+    Service      = "Storage-Blob"
+  })
+
+  private_service_connection {
+    name                           = "${local.prefix}migrate-blob-connection"
+    private_connection_resource_id = azurerm_storage_account.migrate.id
+    subresource_names              = ["blob"]
+    is_manual_connection           = false
+  }
+
+  private_dns_zone_group {
+    name                 = "${local.prefix}migrate-blob-private-dns"
+    private_dns_zone_ids = [azurerm_private_dns_zone.blob.id]
+  }
+}
+
+resource "azurerm_eventgrid_system_topic" "migrate_storage" {
+  count = var.create_migrate_eventgrid_system_topic ? 1 : 0
+
+  name                   = local.name.migrate_eventgrid
+  resource_group_name    = local.migrate_rg_name
+  location               = local.migrate_rg_location
+  source_arm_resource_id = azurerm_storage_account.migrate.id
+  topic_type             = "Microsoft.Storage.StorageAccounts"
+
+  identity {
+    type = "SystemAssigned"
+  }
+
+  tags = merge(local.migrate_tags, {
+    ResourceType = "EventGridSystemTopic"
+    Service      = "Storage-Events"
+  })
+}
+
+############################################
+# 【遷移工具層 / AzureMigrateRG】Database Migration Service
+#   對應入口網站：SQLtoAzureSQL（Azure Database Migration Service）
+#   1. DMS 必須掛在既有 VNet 的專屬子網路（此處為 Spoke-VNET/Migrate-Subnet）
+#   2. 傳統版 DMS（Microsoft.DataMigration/services）已宣告淘汰，
+#      新建移轉專案建議改用 Azure SQL 移轉延伸模組；此處保留以對齊現況資源。
+############################################
+resource "azurerm_database_migration_service" "sql_to_azure_sql" {
+  count               = var.create_database_migration_service ? 1 : 0
+  name                = local.name.dms
+  location            = local.migrate_rg_location
+  resource_group_name = local.migrate_rg_name
+  subnet_id           = azurerm_subnet.migrate[0].id
+  sku_name            = var.database_migration_service_sku
+
+  tags = merge(local.migrate_tags, {
+    ResourceType = "DatabaseMigrationService"
+    Purpose      = "SQL-To-AzureSQL"
+  })
+
+  depends_on = [azurerm_subnet_nat_gateway_association.migrate]
+}
+
+############################################
+# 【遷移工具層】權限指派
+#   讓 Azure Migrate / RSV 的系統受控識別能寫入遷移記錄儲存體
+############################################
+resource "azurerm_role_assignment" "vault_to_migrate_storage" {
+  scope                = azurerm_storage_account.migrate.id
+  role_definition_name = "Storage Blob Data Contributor"
+  principal_id         = azurerm_recovery_services_vault.migrate.identity[0].principal_id
 }

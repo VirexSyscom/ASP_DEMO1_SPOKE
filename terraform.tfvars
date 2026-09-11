@@ -1,6 +1,5 @@
 ############################################
 # terraform.tfvars
-#   整合自 1_terraform / 2_terraform
 ############################################
 
 ############################################
@@ -10,7 +9,7 @@
 # subscription_id = "00000000-0000-0000-0000-000000000000"
 
 ############################################
-# 命名前綴（Hub / Spoke / PROD-HR / UAT-HR 共用）
+# 命名前綴（Hub / Spoke / PROD-HR / UAT-HR / Migrate 共用）
 ############################################
 name_prefix    = "demo"
 name_separator = "-"
@@ -22,7 +21,7 @@ location       = "japaneast"
 location_short = "jpe"
 
 ############################################
-# 四個資源群組（名稱皆不套用前綴）
+# 五個資源群組（名稱皆不套用前綴）
 ############################################
 hub_resource_group_name   = "Hub-Network-RG"
 create_hub_resource_group = true
@@ -35,6 +34,10 @@ create_hr_resource_group = true
 
 uat_hr_resource_group_name   = "UAT-Spoke-HR-RG"
 create_uat_hr_resource_group = true
+
+# 遷移工具層：新增資源一律放在此資源群組
+migrate_resource_group_name   = "AzureMigrateRG"
+create_migrate_resource_group = true
 
 ############################################
 # 標籤
@@ -68,6 +71,11 @@ uat_hr_tags = {
   Purpose     = "UAT"
 }
 
+migrate_tags = {
+  Application = "HR-System"
+  Purpose     = "Migration"
+}
+
 ############################################
 # 網路位址 - Hub
 ############################################
@@ -84,15 +92,13 @@ uat_spoke_vnet_address_space = ["10.20.0.0/16"]
 ap_subnet_prefix           = "10.10.1.0/24"
 db_subnet_prefix           = "10.10.2.0/24"
 pe_subnet_prefix           = "10.10.3.0/24"
+migrate_subnet_prefix      = "10.10.4.0/24" # DMS 專用，建於既有 Spoke-VNET
 bastion_subnet_prefix      = "10.10.250.0/26" # Developer SKU 下不會被使用
 uat_workload_subnet_prefix = "10.20.1.0/24"
 uat_pe_subnet_prefix       = "10.20.2.0/24"
 
 ############################################
 # Bastion
-#   Hub  ：Basic，需公用 IP 與 AzureBastionSubnet
-#   Spoke：Developer，不需公用 IP、不需 AzureBastionSubnet
-#          限制：不支援 VNet peering、單一並行連線、僅限入口網站瀏覽器連線
 ############################################
 hub_bastion_sku    = "Basic"
 create_hub_bastion = true
@@ -102,8 +108,6 @@ create_bastion_subnet = false
 
 ############################################
 # VPN Gateway / Site-to-Site
-#   建立 VPN Gateway 約需 30-45 分鐘；
-#   驗證階段可先設 create_vpn_gateway = false 加速部署。
 ############################################
 create_vpn_gateway          = true
 vpn_gateway_sku             = "VpnGw2AZ"
@@ -158,9 +162,41 @@ storage_replication_type          = "LRS"
 create_uat_eventgrid_system_topic = true
 
 ############################################
+# 遷移工具層（AzureMigrateRG）
+#   對應入口網站六項資源：
+#     Migrate-HR                 -> Azure Migrate 專案
+#     discovervmware4949vault    -> 復原服務保存庫
+#     Migrate-HR8786kv           -> 金鑰保存庫
+#     migratelog                 -> 儲存體帳戶
+#     migratelog-<guid>          -> 事件方格系統主題
+#     SQLtoAzureSQL              -> Database Migration Service
+############################################
+migrate_project_name                  = "Migrate-HR"
+migrate_project_public_network_access = "Enabled"
+
+recovery_vault_name                = "discovervmware"
+recovery_vault_sku                 = "Standard"
+recovery_vault_storage_mode        = "LocallyRedundant"
+recovery_vault_soft_delete_enabled = true
+
+migrate_key_vault_name                          = "migratehr"
+migrate_key_vault_sku                           = "standard"
+migrate_key_vault_public_network_access_enabled = false
+migrate_key_vault_purge_protection_enabled      = false
+
+migrate_storage_name                          = "migratelog"
+migrate_storage_replication_type              = "LRS"
+migrate_storage_public_network_access_enabled = false
+create_migrate_eventgrid_system_topic         = true
+
+create_database_migration_service = true
+database_migration_service_name   = "SQLtoAzureSQL"
+database_migration_service_sku    = "Standard_1vCores"
+
+############################################
 # 監控
-# alert_action_group_id 留空時，網路活動記錄警示
-# 會自動沿用 PROD HR 的 Email Action Group
+#   alert_action_group_id 留空時，網路活動記錄警示
+#   會自動沿用 PROD HR 的 Email Action Group
 ############################################
 alert_email           = "virex_lai@syscom.com.tw"
 alert_action_group_id = ""

@@ -1,7 +1,7 @@
 ############################################
 # outputs.tf
-#   整合自 1_outputs / 2_output
-#   統一格式：共用驗證 → 資源群組 → Hub 網路 → Spoke 網路 → PROD HR → UAT HR
+#   統一格式：共用驗證 → 資源群組 → Hub 網路 → Spoke 網路
+#             → PROD HR → UAT HR → 遷移工具層（AzureMigrateRG）
 ############################################
 
 ############################################
@@ -42,16 +42,22 @@ output "uat_hr_tags_applied" {
   value       = local.uat_hr_tags
 }
 
+output "migrate_tags_applied" {
+  description = "AzureMigrateRG 套用的標籤"
+  value       = local.migrate_tags
+}
+
 ############################################
-# 資源群組（四個獨立 RG）
+# 資源群組（五個獨立 RG）
 ############################################
 output "resource_groups" {
-  description = "本組態管理的四個資源群組"
+  description = "本組態管理的五個資源群組"
   value = {
     hub     = local.hub_rg_name
     network = local.network_rg_name
     hr      = local.hr_rg_name
     uat_hr  = local.uat_hr_rg_name
+    migrate = local.migrate_rg_name
   }
 }
 
@@ -97,12 +103,12 @@ output "vpn_connection" {
 output "hub_spoke_peering" {
   description = "Hub 與 Spoke 之間的 VNet Peering 狀態"
   value = {
-    enabled          = var.enable_hub_spoke_peering
-    gateway_transit  = local.peering_gateway_transit
-    hub_to_spoke_id  = try(azurerm_virtual_network_peering.hub_to_spoke[0].id, null)
-    spoke_to_hub_id  = try(azurerm_virtual_network_peering.spoke_to_hub[0].id, null)
-    hub_to_uat_id    = try(azurerm_virtual_network_peering.hub_to_uat[0].id, null)
-    uat_to_hub_id    = try(azurerm_virtual_network_peering.uat_to_hub[0].id, null)
+    enabled         = var.enable_hub_spoke_peering
+    gateway_transit = local.peering_gateway_transit
+    hub_to_spoke_id = try(azurerm_virtual_network_peering.hub_to_spoke[0].id, null)
+    spoke_to_hub_id = try(azurerm_virtual_network_peering.spoke_to_hub[0].id, null)
+    hub_to_uat_id   = try(azurerm_virtual_network_peering.hub_to_uat[0].id, null)
+    uat_to_hub_id   = try(azurerm_virtual_network_peering.uat_to_hub[0].id, null)
   }
 }
 
@@ -130,6 +136,7 @@ output "subnet_ids" {
     bastion     = var.create_bastion_subnet ? azurerm_subnet.bastion[0].id : null
     uat         = azurerm_subnet.uat_workload.id
     uat_pe      = azurerm_subnet.uat_pe.id
+    migrate     = var.create_database_migration_service ? azurerm_subnet.migrate[0].id : null
   }
 }
 
@@ -139,10 +146,11 @@ output "nat_gateway_public_ip" {
 }
 
 output "private_dns_zone_ids" {
-  description = "Private DNS Zone 資源 ID（Hub / PROD / UAT 共用）"
+  description = "Private DNS Zone 資源 ID（Hub / PROD / UAT / 遷移層共用）"
   value = {
-    blob = azurerm_private_dns_zone.blob.id
-    sql  = azurerm_private_dns_zone.sql.id
+    blob      = azurerm_private_dns_zone.blob.id
+    sql       = azurerm_private_dns_zone.sql.id
+    key_vault = azurerm_private_dns_zone.keyvault.id
   }
 }
 
@@ -249,5 +257,57 @@ output "uat_monitoring" {
     action_group_id          = azurerm_monitor_action_group.uat_vm.id
     vm_availability_alert_id = azurerm_monitor_metric_alert.uat_vm_availability.id
     sql_dtu_alert_id         = azurerm_monitor_metric_alert.uat_sql_dtu.id
+  }
+}
+
+############################################
+# 遷移工具層（AzureMigrateRG）
+############################################
+output "migrate_recovery_vault" {
+  description = "復原服務保存庫（對應 discovervmware4949vault）"
+  value = {
+    name         = azurerm_recovery_services_vault.migrate.name
+    id           = azurerm_recovery_services_vault.migrate.id
+    sku          = azurerm_recovery_services_vault.migrate.sku
+    principal_id = azurerm_recovery_services_vault.migrate.identity[0].principal_id
+  }
+}
+
+output "migrate_project" {
+  description = "Azure Migrate 專案（對應 Migrate-HR）"
+  value = {
+    name = azapi_resource.migrate_project.name
+    id   = azapi_resource.migrate_project.id
+  }
+}
+
+output "migrate_key_vault" {
+  description = "遷移層 Key Vault（對應 Migrate-HR8786kv）"
+  value = {
+    name                = azurerm_key_vault.migrate.name
+    id                  = azurerm_key_vault.migrate.id
+    vault_uri           = azurerm_key_vault.migrate.vault_uri
+    private_endpoint_id = try(azurerm_private_endpoint.migrate_kv[0].id, null)
+  }
+}
+
+output "migrate_storage" {
+  description = "遷移記錄儲存體與事件方格（對應 migratelog / migratelog-<guid>）"
+  value = {
+    account_name        = azurerm_storage_account.migrate.name
+    account_id          = azurerm_storage_account.migrate.id
+    private_endpoint_id = try(azurerm_private_endpoint.migrate_blob[0].id, null)
+    system_topic_id     = var.create_migrate_eventgrid_system_topic ? azurerm_eventgrid_system_topic.migrate_storage[0].id : null
+  }
+}
+
+output "database_migration_service" {
+  description = "Database Migration Service（對應 SQLtoAzureSQL）"
+  value = {
+    created   = var.create_database_migration_service
+    name      = try(azurerm_database_migration_service.sql_to_azure_sql[0].name, null)
+    id        = try(azurerm_database_migration_service.sql_to_azure_sql[0].id, null)
+    sku       = try(azurerm_database_migration_service.sql_to_azure_sql[0].sku_name, null)
+    subnet_id = try(azurerm_subnet.migrate[0].id, null)
   }
 }

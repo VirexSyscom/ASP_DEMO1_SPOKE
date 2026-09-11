@@ -1,12 +1,12 @@
 ############################################
 # variables.tf
-#   整合自 1_variables / 2_variables
-#   四個資源群組全部統一為同一套變數命名規則：
+#   五個資源群組全部統一為同一套變數命名規則：
 #     <層>_resource_group_name / create_<層>_resource_group / <層>_tags
 #       hub     ：Hub 網路（VPN Gateway / Bastion）
 #       network ：Spoke 網路（PROD + UAT VNet）
 #       hr      ：PROD HR 工作負載
 #       uat_hr  ：UAT  HR 工作負載
+#       migrate ：AzureMigrateRG 遷移工具層（新增）
 ############################################
 
 ############################################
@@ -22,8 +22,7 @@ variable "subscription_id" {
 }
 
 ############################################
-# 命名前綴（四層共用同一套規則）
-#   原 2_variables 的 resource_name_prefix 已統一為 name_prefix
+# 命名前綴（五層共用同一套規則）
 ############################################
 variable "name_prefix" {
   description = "所有資源名稱的前綴詞，例如 demo、hr、corp。留空則不加前綴。資源群組名稱不套用前綴。"
@@ -34,7 +33,6 @@ variable "name_prefix" {
     condition     = can(regex("^[a-zA-Z0-9-]*$", var.name_prefix))
     error_message = "name_prefix 僅能包含英數字與連字號。"
   }
-
   validation {
     condition     = length(var.name_prefix) <= 10
     error_message = "name_prefix 建議不超過 10 字元，避免資源名稱超出 Azure 長度限制。"
@@ -63,8 +61,7 @@ variable "location_short" {
 }
 
 ############################################
-# 資源群組（四個獨立 RG，名稱皆不套用前綴）
-#   原 2_main 的 Hub RG 會加前綴，整合後統一為「不加前綴、只加標籤」
+# 資源群組（五個獨立 RG，名稱皆不套用前綴）
 ############################################
 variable "hub_resource_group_name" {
   description = "Hub 網路資源群組名稱（VPN Gateway / Hub Bastion 置於此）"
@@ -110,6 +107,18 @@ variable "uat_hr_resource_group_name" {
 
 variable "create_uat_hr_resource_group" {
   description = "true = 由本組態建立 UAT HR RG；false = 沿用既有 RG"
+  type        = bool
+  default     = true
+}
+
+variable "migrate_resource_group_name" {
+  description = "遷移工具資源群組名稱（Azure Migrate / RSV / Key Vault / 儲存體 / DMS 皆置於此）"
+  type        = string
+  default     = "AzureMigrateRG"
+}
+
+variable "create_migrate_resource_group" {
+  description = "true = 由本組態建立 AzureMigrateRG；false = 沿用既有 RG"
   type        = bool
   default     = true
 }
@@ -170,6 +179,12 @@ variable "uat_hr_tags" {
   default     = {}
 }
 
+variable "migrate_tags" {
+  description = "僅套用於 AzureMigrateRG 資源的額外標籤"
+  type        = map(string)
+  default     = {}
+}
+
 ############################################
 # 網路位址 - Hub
 ############################################
@@ -219,7 +234,7 @@ variable "db_subnet_prefix" {
 }
 
 variable "pe_subnet_prefix" {
-  description = "PROD Private Endpoint 專用子網路（PROD HR SQL PE 佈署於此）"
+  description = "PROD Private Endpoint 專用子網路（PROD HR SQL PE、遷移層 PE 佈署於此）"
   type        = string
   default     = "10.10.3.0/24"
 }
@@ -243,9 +258,18 @@ variable "uat_pe_subnet_prefix" {
 }
 
 ############################################
+# 網路位址 - 遷移專用子網路（沿用 PROD Spoke-VNET）
+#   Database Migration Service 需要一個「專屬委派子網路」，
+#   不可與 AP / DB / PE 子網路共用。
+############################################
+variable "migrate_subnet_prefix" {
+  description = "Database Migration Service 專用子網路（建立於既有的 PROD Spoke-VNET 內）"
+  type        = string
+  default     = "10.10.4.0/24"
+}
+
+############################################
 # Bastion
-#   Hub  ：Basic/Standard/Premium，需 AzureBastionSubnet + 公用 IP
-#   Spoke：預設 Developer，免公用 IP、免 AzureBastionSubnet
 ############################################
 variable "hub_bastion_sku" {
   description = "Hub Bastion SKU（Hub 為傳統模式，需公用 IP 與 AzureBastionSubnet）"
@@ -474,6 +498,150 @@ variable "create_uat_eventgrid_system_topic" {
   description = "是否為 UAT 儲存體帳戶建立 Event Grid System Topic"
   type        = bool
   default     = true
+}
+
+############################################
+# 【新增】遷移層：Azure Migrate 專案
+############################################
+variable "migrate_project_name" {
+  description = "Azure Migrate 專案基底名稱（實際名稱會自動加上前綴）"
+  type        = string
+  default     = "Migrate-HR"
+}
+
+variable "migrate_project_public_network_access" {
+  description = "Azure Migrate 專案是否允許公用網路存取"
+  type        = string
+  default     = "Enabled"
+
+  validation {
+    condition     = contains(["Enabled", "Disabled"], var.migrate_project_public_network_access)
+    error_message = "migrate_project_public_network_access 必須為 Enabled 或 Disabled。"
+  }
+}
+
+############################################
+# 【新增】遷移層：Recovery Services Vault
+############################################
+variable "recovery_vault_name" {
+  description = "復原服務保存庫基底名稱（實際名稱會自動加上前綴與亂數後綴）"
+  type        = string
+  default     = "discovervmware"
+}
+
+variable "recovery_vault_sku" {
+  description = "復原服務保存庫 SKU"
+  type        = string
+  default     = "Standard"
+
+  validation {
+    condition     = contains(["Standard", "RS0"], var.recovery_vault_sku)
+    error_message = "recovery_vault_sku 必須為 Standard 或 RS0。"
+  }
+}
+
+variable "recovery_vault_storage_mode" {
+  description = "復原服務保存庫儲存體複寫模式"
+  type        = string
+  default     = "LocallyRedundant"
+
+  validation {
+    condition     = contains(["LocallyRedundant", "GeoRedundant", "ZoneRedundant"], var.recovery_vault_storage_mode)
+    error_message = "recovery_vault_storage_mode 必須為 LocallyRedundant、GeoRedundant 或 ZoneRedundant。"
+  }
+}
+
+variable "recovery_vault_soft_delete_enabled" {
+  description = "復原服務保存庫是否啟用虛刪除（Soft Delete）"
+  type        = bool
+  default     = true
+}
+
+############################################
+# 【新增】遷移層：Key Vault
+############################################
+variable "migrate_key_vault_name" {
+  description = "遷移層 Key Vault 基底名稱（實際名稱會自動加上前綴與亂數後綴）"
+  type        = string
+  default     = "migratehr"
+}
+
+variable "migrate_key_vault_sku" {
+  description = "Key Vault SKU"
+  type        = string
+  default     = "standard"
+
+  validation {
+    condition     = contains(["standard", "premium"], var.migrate_key_vault_sku)
+    error_message = "migrate_key_vault_sku 必須為 standard 或 premium。"
+  }
+}
+
+variable "migrate_key_vault_public_network_access_enabled" {
+  description = "Key Vault 是否允許公用網路存取。false 時一律透過 Private Endpoint 連線"
+  type        = bool
+  default     = false
+}
+
+variable "migrate_key_vault_purge_protection_enabled" {
+  description = "Key Vault 是否啟用清除保護（啟用後無法提前刪除，請審慎評估）"
+  type        = bool
+  default     = false
+}
+
+############################################
+# 【新增】遷移層：儲存體（migratelog）
+############################################
+variable "migrate_storage_name" {
+  description = "遷移記錄儲存體帳戶基底名稱（實際名稱會自動加上緊湊前綴與亂數後綴）"
+  type        = string
+  default     = "migratelog"
+}
+
+variable "migrate_storage_replication_type" {
+  description = "遷移記錄儲存體帳戶複寫類型"
+  type        = string
+  default     = "LRS"
+}
+
+variable "migrate_storage_public_network_access_enabled" {
+  description = "遷移記錄儲存體帳戶是否允許公用網路存取。false 時一律透過 Private Endpoint 連線"
+  type        = bool
+  default     = false
+}
+
+variable "create_migrate_eventgrid_system_topic" {
+  description = "是否為遷移記錄儲存體帳戶建立 Event Grid System Topic"
+  type        = bool
+  default     = true
+}
+
+############################################
+# 【新增】遷移層：Database Migration Service
+############################################
+variable "create_database_migration_service" {
+  description = "是否建立 Azure Database Migration Service（傳統版 DMS 已宣告淘汰，新專案建議改用 Azure SQL 移轉延伸模組）"
+  type        = bool
+  default     = true
+}
+
+variable "database_migration_service_name" {
+  description = "Database Migration Service 基底名稱（實際名稱會自動加上前綴）"
+  type        = string
+  default     = "SQLtoAzureSQL"
+}
+
+variable "database_migration_service_sku" {
+  description = "Database Migration Service SKU"
+  type        = string
+  default     = "Standard_1vCores"
+
+  validation {
+    condition = contains([
+      "Standard_1vCores", "Standard_2vCores", "Standard_4vCores", "Premium_4vCores"
+    ], var.database_migration_service_sku)
+    error_message = "請指定有效的 DMS SKU。"
+  }
 }
 
 ############################################
